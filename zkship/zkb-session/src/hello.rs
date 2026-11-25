@@ -14,6 +14,8 @@ pub const SID_DOMAIN: &[u8] = b"zkbattleship/reference/v1/sid";
 
 pub const GENESIS_DOMAIN: &[u8] = b"zkbattleship/reference/v1/genesis";
 
+pub const SAFETY_CODE_DOMAIN: &[u8] = b"zkbattleship/reference/v1/safety-code";
+
 pub const WIRE_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,12 +247,53 @@ impl SessionBootstrap {
         &self.genesis_hash
     }
 
-    pub fn role_of(&self, key: &PeerKey) -> Role {
+    pub fn params_id(&self) -> &[u8; 32] {
+        self.hello_a.params_id()
+    }
+
+    pub fn try_role_of(&self, key: &PeerKey) -> Option<Role> {
         if key.as_bytes() == self.hello_a.key().as_bytes() {
-            Role::A
+            Some(Role::A)
+        } else if key.as_bytes() == self.hello_b.key().as_bytes() {
+            Some(Role::B)
         } else {
-            Role::B
+            None
         }
+    }
+
+    pub fn role_of(&self, key: &PeerKey) -> Role {
+        self.try_role_of(key)
+            .expect("key must belong to this bootstrap")
+    }
+
+    pub fn peer_key_for(&self, key: &PeerKey) -> Option<&PeerKey> {
+        if key.as_bytes() == self.hello_a.key().as_bytes() {
+            Some(self.hello_b.key())
+        } else if key.as_bytes() == self.hello_b.key().as_bytes() {
+            Some(self.hello_a.key())
+        } else {
+            None
+        }
+    }
+
+    /// 12-digit out-of-band short authentication string (`XXXX-XXXX-XXXX`)
+    /// bound to `params_id` and both identity keys.
+    pub fn safety_code(&self) -> String {
+        let mut h = Sha512_256::new();
+        h.update(SAFETY_CODE_DOMAIN);
+        h.update(self.params_id());
+        h.update(self.hello_a.key().as_bytes());
+        h.update(self.hello_b.key().as_bytes());
+        let digest: [u8; 32] = h.finalize().into();
+        let mut buf = [0u8; 8];
+        buf[..6].copy_from_slice(&digest[..6]);
+        let num = u64::from_le_bytes(buf) % 1_000_000_000_000;
+        format!(
+            "{:04}-{:04}-{:04}",
+            num / 100_000_000,
+            (num / 10_000) % 10_000,
+            num % 10_000
+        )
     }
 
     pub fn hello_a(&self) -> &Hello {
@@ -274,6 +317,9 @@ pub fn complete_bootstrap(
     first: CheckedHello,
     second: CheckedHello,
 ) -> Result<SessionBootstrap, HelloError> {
+    if first.hello.params_id() != second.hello.params_id() {
+        return Err(HelloError::ParamsIdMismatch);
+    }
     if first.hello.key().as_bytes() == second.hello.key().as_bytes() {
         return Err(HelloError::EqualIdentityKeys);
     }
@@ -434,7 +480,37 @@ mod tests {
         };
         assert_eq!(bootstrap.role_of(&lo.peer_key()), Role::A);
         assert_eq!(bootstrap.role_of(&hi.peer_key()), Role::B);
+        assert_eq!(bootstrap.peer_key_for(&lo.peer_key()), Some(&hi.peer_key()));
+        assert_eq!(bootstrap.peer_key_for(&hi.peer_key()), Some(&lo.peer_key()));
+        let third = IdentityKeypair::from_seed(&[0x77; 32]).peer_key();
+        assert_eq!(bootstrap.try_role_of(&third), None);
+        assert_eq!(bootstrap.peer_key_for(&third), None);
+        assert_eq!(bootstrap.safety_code().len(), 14);
         assert_eq!(bootstrap.hello_a().key(), &lo.peer_key());
         assert_eq!(bootstrap.hello_b().key(), &hi.peer_key());
+    }
+
+    #[test]
+    fn bootstrap_rejects_mismatched_params_id() {
+        let ka = IdentityKeypair::from_seed(&[0x11; 32]);
+        let kb = IdentityKeypair::from_seed(&[0x22; 32]);
+        let ha = Hello::create(&ka, *Parameters::standard().params_id(), &mut rng(1));
+        let hb = Hello::create(&kb, *Parameters::no_touch().params_id(), &mut rng(2));
+        let ca = check_hello(
+            ha,
+            Parameters::standard().params_id(),
+            &ExpectedKey::new(ka.peer_key()),
+        )
+        .unwrap();
+        let cb = check_hello(
+            hb,
+            Parameters::no_touch().params_id(),
+            &ExpectedKey::new(kb.peer_key()),
+        )
+        .unwrap();
+        assert_eq!(
+            complete_bootstrap(ca, cb),
+            Err(HelloError::ParamsIdMismatch)
+        );
     }
 }

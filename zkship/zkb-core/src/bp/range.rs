@@ -42,22 +42,32 @@ pub struct RangeProof {
     ipa: InnerProductProof,
 }
 
+/// Checked `next_pow2(n*m)` for `1 <= n <= 64`, `m >= 1`.
+pub fn checked_padded_slots(n: usize, m: usize) -> Option<usize> {
+    if n == 0 || n > 64 || m == 0 {
+        return None;
+    }
+    n.checked_mul(m)?.checked_next_power_of_two()
+}
+
+/// Checked `32 * (4 + 2 lg N' + 5)`.
+pub fn checked_encoded_len(n: usize, m: usize) -> Option<usize> {
+    let lg = checked_padded_slots(n, m)?.trailing_zeros() as usize;
+    32usize.checked_mul(9usize.checked_add(2usize.checked_mul(lg)?)?)
+}
+
 /// `next_pow2(n*m)`.
 pub fn padded_slots(n: usize, m: usize) -> usize {
-    (n * m).next_power_of_two()
+    checked_padded_slots(n, m).expect("range proof shape must be non-zero and fit usize")
 }
 
 /// `32 * (4 + 2 lg N' + 5)`.
 pub fn encoded_len(n: usize, m: usize) -> usize {
-    let lg = padded_slots(n, m).trailing_zeros() as usize;
-    32 * (9 + 2 * lg)
+    checked_encoded_len(n, m).expect("range proof shape must fit usize")
 }
 
 fn check_shape(gens: &BpGens, n: usize, m: usize) -> Result<usize, BpError> {
-    if n == 0 || n > 64 || m == 0 {
-        return Err(BpError::BadShape);
-    }
-    let slots = padded_slots(n, m);
+    let slots = checked_padded_slots(n, m).ok_or(BpError::BadShape)?;
     if slots > gens.capacity() {
         return Err(BpError::BadShape);
     }
@@ -119,7 +129,7 @@ pub fn prove<R: RngCore + CryptoRng>(
         return Err(BpError::BadShape);
     }
     let slots = check_shape(gens, n, m)?;
-    if n < 64 && values.iter().any(|&v| v >> n != 0) {
+    if n < 64 && values.iter().fold(0u64, |acc, &v| acc | (v >> n)) != 0 {
         return Err(BpError::ValueOutOfRange);
     }
     debug_assert!(values
@@ -270,7 +280,7 @@ fn prove_unchecked<R: RngCore + CryptoRng>(
         gens.h(slots).to_vec(),
         l,
         r,
-    );
+    )?;
 
     Ok(RangeProof {
         a,
@@ -288,11 +298,16 @@ impl RangeProof {
     /// Batching weight for the t-hat equation, drawn after all proof data,
     /// including `a` and `b`, from a fork so the caller's transcript stays in
     /// step with the prover's for any proof that follows on it.
-    fn batching_weight(&self, transcript: &Transcript) -> Scalar {
+    fn batching_weight(&self, transcript: &Transcript) -> Result<Scalar, BpError> {
         let mut fork = transcript.clone();
         append_scalar(&mut fork, b"ipa-a", &self.ipa.a);
         append_scalar(&mut fork, b"ipa-b", &self.ipa.b);
-        challenge_scalar(&mut fork, b"c")
+        nonzero_challenge(&mut fork, b"c")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_t_hat(&mut self) {
+        self.t_hat += Scalar::ONE;
     }
 
     pub fn verify(
@@ -322,7 +337,7 @@ impl RangeProof {
         append_scalar(transcript, b"mu", &self.mu);
         let w_ipa = nonzero_challenge(transcript, b"w")?;
         let v = self.ipa.verification_scalars(slots, transcript)?;
-        let c = self.batching_weight(transcript);
+        let c = self.batching_weight(transcript)?;
 
         let y_pows = powers(&y, slots);
         let y_inv_pows = powers(&y.invert(), slots);
@@ -383,14 +398,16 @@ impl RangeProof {
 
     /// Exact length for the shape `(n, m)`; canonical points and scalars.
     pub fn decode(bytes: &[u8], n: usize, m: usize) -> Result<RangeProof, BpError> {
-        let expected = encoded_len(n, m);
+        let expected = checked_encoded_len(n, m).ok_or(BpError::BadShape)?;
         if bytes.len() != expected {
             return Err(BpError::WrongLength {
                 expected,
                 actual: bytes.len(),
             });
         }
-        let r = padded_slots(n, m).trailing_zeros() as usize;
+        let r = checked_padded_slots(n, m)
+            .ok_or(BpError::BadShape)?
+            .trailing_zeros() as usize;
         let point = |i: usize| read_point(bytes, 32 * i);
         let scalar = |i: usize| read_scalar(bytes, 32 * i);
         let l_vec = (0..r)
@@ -647,14 +664,26 @@ mod tests {
         let f = fixture();
         let (_, proof) = f.prove(&[1, 0, 1], 1, 8);
         let at = Transcript::new(b"range-test");
-        let c = proof.batching_weight(&at);
+        let c = proof.batching_weight(&at).unwrap();
         let mut t = proof.clone();
         t.ipa.a += Scalar::ONE;
-        assert_ne!(t.batching_weight(&at), c);
+        assert_ne!(t.batching_weight(&at).unwrap(), c);
         let mut t = proof.clone();
         t.ipa.b += Scalar::ONE;
-        assert_ne!(t.batching_weight(&at), c);
-        assert_eq!(proof.batching_weight(&at), c);
+        assert_ne!(t.batching_weight(&at).unwrap(), c);
+        assert_eq!(proof.batching_weight(&at).unwrap(), c);
+    }
+
+    #[test]
+    fn decode_and_shape_reject_zero_or_overflow() {
+        let f = fixture();
+        let (_, proof) = f.prove(&[1], 1, 1);
+        let bytes = proof.encode();
+        for (n, m) in [(0, 1), (1, 0), (65, 1), (8, usize::MAX), (usize::MAX, 2)] {
+            assert_eq!(RangeProof::decode(&bytes, n, m), Err(BpError::BadShape));
+            assert_eq!(check_shape(&f.gens, n, m), Err(BpError::BadShape));
+            assert!(checked_encoded_len(n, m).is_none());
+        }
     }
 
     #[test]

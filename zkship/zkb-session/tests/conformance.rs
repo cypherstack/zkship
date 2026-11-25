@@ -11,6 +11,7 @@ use zkb_core::setup::{self, SetupMessage};
 use zkb_session::hello::{self, Hello};
 use zkb_session::identity::{ExpectedKey, IdentityKeypair, PeerAuthPolicy};
 use zkb_session::state::{AcceptOutcome, Session};
+use zkb_session::verify::{self, TranscriptVerdict};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -232,6 +233,23 @@ fn game_transcript_vector_replays_byte_for_byte() {
         v["loser_hits"].parse::<u8>().unwrap()
     );
     assert_eq!(loser.game().unwrap().hits_conceded(), T as u8);
+
+    // Confirm the zero-secret public verifier accepts the exact pinned transcript.
+    let report = verify::verify_transcript(
+        &unhex(&v["hello_role_a"]),
+        &unhex(&v["hello_role_b"]),
+        &frames,
+    )
+    .unwrap();
+    assert!(matches!(
+        report.verdict,
+        TranscriptVerdict::Completed { winner: w } if w == winner
+    ));
+    assert_eq!(report.frames_verified, frames.len());
+    assert_eq!(
+        report.hits_by_a + report.hits_by_b,
+        T as u8 + v["loser_hits"].parse::<u8>().unwrap()
+    );
 }
 
 /// Decodes, re-encodes and verifies the pinned setup message.
@@ -256,6 +274,32 @@ fn setup_message_vector_verifies() {
     assert_eq!(sha512_256(&bytes), v["setup_sha512_256"]);
 
     let msg = SetupMessage::decode(&bytes, Rules::Standard).unwrap();
+    assert_eq!(msg.encode(), bytes);
+    setup::verify(params, &unhex32(&v["prover_id"]), &unhex32(&v["sid"]), &msg).unwrap();
+}
+
+/// Decodes, re-encodes and verifies the pinned no-touch setup message.
+#[test]
+fn notouch_setup_message_vector_verifies() {
+    let params = Parameters::no_touch();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../vectors/setup_message_notouch_v1.txt");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let v = parse_vector(&text);
+
+    assert_eq!(v["profile"], "zkbattleship/paper/v1/no-touch");
+    assert_eq!(v["params_id"], hex(params.params_id()));
+
+    let bytes = unhex(&v["setup_hex"]);
+    assert_eq!(bytes.len(), v["setup_len"].parse::<usize>().unwrap());
+    let sha512_256 = |bytes: &[u8]| {
+        use sha2::{Digest, Sha512_256};
+        hex(&Sha512_256::digest(bytes))
+    };
+    assert_eq!(sha512_256(&bytes), v["setup_sha512_256"]);
+
+    let msg = SetupMessage::decode(&bytes, Rules::NoTouch).unwrap();
     assert_eq!(msg.encode(), bytes);
     setup::verify(params, &unhex32(&v["prover_id"]), &unhex32(&v["sid"]), &msg).unwrap();
 }

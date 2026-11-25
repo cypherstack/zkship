@@ -1,0 +1,7 @@
+{$ZKB_RELAY_HOST} {
+	encode gzip
+
+	reverse_proxy zkb-relay:8080 {
+		header_up X-Real-IP {remote_host}
+	}
+}

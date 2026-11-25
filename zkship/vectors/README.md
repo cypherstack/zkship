@@ -14,6 +14,12 @@ the anchor being the top or left cell.
 Regenerate: `cargo run -p zkb-core --example generate_setup_vector` (checks the digest pinned in `setup.rs`).
 Conformance: `zkb-session/tests/conformance.rs::setup_message_vector_verifies`.
 
+## setup_message_notouch_v1.txt
+
+- No-touch setup vector (`setup_len` 20,544 bytes).
+- Regenerate: `cargo run -p zkb-core --example generate_notouch_setup_vector`.
+- Conformance: `zkb-session/tests/conformance.rs::notouch_setup_message_vector_verifies`.
+
 ## game_transcript_v1.txt
 
 - `key_seed_role_a/b`, `hello_role_a/b` (162 bytes each); `fleet_role_a/b`.

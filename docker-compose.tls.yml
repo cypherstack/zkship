@@ -1,0 +1,45 @@
+services:
+  zkb-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - "8080"
+    environment:
+      ZKB_BIND_ADDR: "0.0.0.0:8080"
+      ZKB_ALLOWED_ORIGINS: "${ZKB_ALLOWED_ORIGINS:?set ZKB_ALLOWED_ORIGINS e.g. https://play.example.com}"
+      ZKB_TRUST_PROXY: "1"
+      ZKB_MAX_ROOMS: "${ZKB_MAX_ROOMS:-4096}"
+      ZKB_MAX_CONNS_PER_IP: "${ZKB_MAX_CONNS_PER_IP:-32}"
+      ZKB_ROOM_CREATE_PER_MIN: "${ZKB_ROOM_CREATE_PER_MIN:-60}"
+      ZKB_VERIFY_PER_MIN: "${ZKB_VERIFY_PER_MIN:-30}"
+      ZKB_MAX_CONCURRENT_VERIFICATIONS: "${ZKB_MAX_CONCURRENT_VERIFICATIONS:-2}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.9-alpine
+    depends_on:
+      zkb-relay:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      ZKB_RELAY_HOST: "${ZKB_RELAY_HOST:?set ZKB_RELAY_HOST to your relay DNS name}"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

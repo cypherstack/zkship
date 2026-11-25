@@ -62,6 +62,9 @@ const OPENING_SCALARS: usize = K + 2 * K;
 
 /// `K_l = l^2 (l^2 - 1) / 12`, the least spread of `l` distinct integers.
 pub const fn min_spread(length: u8) -> u64 {
+    if length <= 1 {
+        return 0;
+    }
     let l2 = (length as u64) * (length as u64);
     l2 * (l2 - 1) / 12
 }
@@ -439,7 +442,7 @@ pub fn prove_with_rng<R: RngCore + CryptoRng>(
     // The fleet may have been validated under other rules.
     Fleet::new(*fleet.ships(), params.rules()).map_err(SetupError::IllegalFleet)?;
     let bits = fleet.ship_bits();
-    let orientation = fleet.orientation_bits();
+    let orientation = Zeroizing::new(fleet.orientation_bits());
     let witness = Witness {
         bits: &bits,
         orientation: &orientation,
@@ -654,10 +657,9 @@ fn prove_witness<R: RngCore + CryptoRng>(
                     }
                     let own = i64::from(w.bits[j * N + i]);
                     let y = NO_TOUCH_M as i64 * (1 - own) - others;
-                    // Negative only for an illegal fleet. The cheating test
-                    // prover then proves `y mod 2^8`, while `Y_{j,i}` commits
-                    // to `p - |y|`, so verification fails (paper Lemma 6.3).
-                    values.push(y.rem_euclid(1 << NO_TOUCH_BITS) as u64);
+                    // Mask to 8 bits branchlessly: negative only for an illegal fleet,
+                    // which then proves `y mod 2^8` while `Y_{j,i}` commits to `p - |y|`.
+                    values.push((y as u64) & ((1u64 << NO_TOUCH_BITS) - 1));
                     blindings.push(-big_m * rho[j * N + i] - others_blind);
                 }
             }
@@ -864,8 +866,8 @@ mod tests {
         assert_eq!(encoded_len(Rules::NoTouch), 19_488 + (28 + 5) * 32);
         assert_eq!(BIT_VALUES, 605);
         assert_eq!(
-            [5, 4, 3, 2].map(min_spread),
-            [50, 20, 6, 1],
+            [5, 4, 3, 2, 1, 0].map(min_spread),
+            [50, 20, 6, 1, 0, 0],
             "K_l = l^2 (l^2 - 1) / 12"
         );
     }
@@ -986,15 +988,7 @@ mod tests {
         push("z", &|m| m.square_responses[0][1].z1 += one);
         push("lambda", &|m| m.length_openings[4] += one);
         push("delta", &|m| m.moment_openings[2][0] += one);
-        push("bits", &|m| {
-            let mut b = m.bits.encode();
-            b[40] ^= 1;
-            m.bits = RangeProof::decode(&b, 1, BIT_VALUES).unwrap_or(m.bits.clone());
-            m.length_openings[0] += Scalar::ZERO;
-            if RangeProof::decode(&b, 1, BIT_VALUES).is_err() {
-                m.ship_cells[0] += g;
-            }
-        });
+        push("bits", &|m| m.bits.tamper_t_hat());
         push("no-touch swap", &|m| {
             let other = setup(Parameters::no_touch(), &fleet_b());
             m.no_touch = other.no_touch;

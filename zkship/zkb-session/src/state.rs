@@ -11,19 +11,22 @@
 //! transcript cannot attribute silence (paper Construction 7.1, S7, and Section 10);
 //! D [`SessionError::InternalInvariant`] = implementation incident.
 
-use crate::codec::{CodecError, MessageType};
+use crate::codec::{CodecError, MessageType, MAX_FRAME_SIZE, MAX_TRANSCRIPT_FRAMES};
 use crate::coin;
 use crate::frame::{self, AuthenticatedFrame, ChainError, ChainExpectation, SignedFrame};
+use crate::hello::SessionBootstrap;
 use crate::identity::{AuthenticatedPeer, IdentityKeypair};
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::traits::Identity;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use std::fmt;
+use subtle::{Choice, ConditionallySelectable};
 use zeroize::Zeroizing;
-use zkb_core::answers::{AnswerDecodeError, AnswerRejection};
+use zkb_core::answers::{self, AnswerContext, AnswerDecodeError, AnswerRejection, ShotAnswer};
 use zkb_core::fleet::{Fleet, SHIP_BITS};
 use zkb_core::game::{Game, GameContext, GameError, Role, ShotOutcome, State as GameState};
-use zkb_core::params::{CellIndex, Parameters};
+use zkb_core::params::{CellIndex, Parameters, Rules, K};
 use zkb_core::setup::{self, SetupError, SetupMessage, VerifiedSetup};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,11 +180,20 @@ enum CoinStep {
     Reveal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseKind {
+    Commit,
+    Coin,
+    Playing,
+    Finished,
+    Aborted,
+}
+
 #[cfg_attr(fuzzing, derive(Clone))]
 struct CoinPhase<'a> {
     step: CoinStep,
     coin_commit: Option<[u8; 32]>,
-    r_a: Option<[u8; 32]>,
+    r_a: Option<Zeroizing<[u8; 32]>>,
     r_b: Option<[u8; 32]>,
     own: OwnBoard,
     peer_verified: Option<VerifiedSetup>,
@@ -208,15 +220,32 @@ enum Transition {
     Finished { winner: Role },
 }
 
+#[cfg_attr(fuzzing, derive(Clone))]
+enum KeypairRef<'a> {
+    Borrowed(&'a IdentityKeypair),
+    Owned(Box<IdentityKeypair>),
+}
+
+impl<'a> KeypairRef<'a> {
+    fn as_ref(&self) -> &IdentityKeypair {
+        match self {
+            KeypairRef::Borrowed(kp) => kp,
+            KeypairRef::Owned(kp) => kp,
+        }
+    }
+}
+
 /// One local player's view.
 #[cfg_attr(fuzzing, derive(Clone))]
 pub struct Session<'a> {
     params: &'a Parameters,
-    keypair: &'a IdentityKeypair,
+    keypair: KeypairRef<'a>,
     local_role: Role,
     peer: AuthenticatedPeer,
     sid: [u8; 32],
+    genesis_hash: [u8; 32],
     head: ChainHead,
+    first_mover: Option<Role>,
     phase: Phase<'a>,
     transcript: Vec<Vec<u8>>,
 }
@@ -315,6 +344,34 @@ impl<'a> Session<'a> {
         fleet: Fleet,
         rho: Vec<Scalar>,
     ) -> Result<Session<'a>, SessionError> {
+        Self::new_with_keypair(
+            params,
+            KeypairRef::Borrowed(keypair),
+            local_role,
+            peer,
+            sid,
+            genesis_hash,
+            fleet,
+            rho,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_keypair(
+        params: &'a Parameters,
+        keypair: KeypairRef<'a>,
+        local_role: Role,
+        peer: AuthenticatedPeer,
+        sid: [u8; 32],
+        genesis_hash: [u8; 32],
+        fleet: Fleet,
+        rho: Vec<Scalar>,
+    ) -> Result<Session<'a>, SessionError> {
+        if keypair.as_ref().peer_key() == *peer.key() {
+            return Err(SessionError::WrongLocalState(
+                "local identity key must differ from peer key",
+            ));
+        }
         let rho = Zeroizing::new(rho);
         if rho.len() != SHIP_BITS {
             return Err(SessionError::LocalGame(GameError::WrongWitnessLength {
@@ -331,10 +388,12 @@ impl<'a> Session<'a> {
             local_role,
             peer,
             sid,
+            genesis_hash,
             head: ChainHead {
                 sequence: 0,
                 hash: genesis_hash,
             },
+            first_mover: None,
             phase: Phase::Commit(Box::new(CommitPhase {
                 a_done: false,
                 b_done: false,
@@ -350,12 +409,142 @@ impl<'a> Session<'a> {
         })
     }
 
+    /// Variant of [`Session::new`] that takes ownership of `keypair`, yielding `'static`
+    /// when `params` is `'static` (useful for FFI/WASM hosts).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_owned(
+        params: &'a Parameters,
+        keypair: IdentityKeypair,
+        local_role: Role,
+        peer: AuthenticatedPeer,
+        sid: [u8; 32],
+        genesis_hash: [u8; 32],
+        fleet: Fleet,
+        rho: Vec<Scalar>,
+    ) -> Result<Session<'a>, SessionError> {
+        Self::new_with_keypair(
+            params,
+            KeypairRef::Owned(Box::new(keypair)),
+            local_role,
+            peer,
+            sid,
+            genesis_hash,
+            fleet,
+            rho,
+        )
+    }
+
+    pub fn from_bootstrap(
+        params: &'a Parameters,
+        keypair: &'a IdentityKeypair,
+        bootstrap: &SessionBootstrap,
+        peer: AuthenticatedPeer,
+        fleet: Fleet,
+        rho: Vec<Scalar>,
+    ) -> Result<Session<'a>, SessionError> {
+        let (local_role, sid, genesis_hash) =
+            validate_bootstrap(params, keypair, bootstrap, &peer)?;
+        Session::new(
+            params,
+            keypair,
+            local_role,
+            peer,
+            sid,
+            genesis_hash,
+            fleet,
+            rho,
+        )
+    }
+
+    pub fn from_bootstrap_owned(
+        params: &'a Parameters,
+        keypair: IdentityKeypair,
+        bootstrap: &SessionBootstrap,
+        peer: AuthenticatedPeer,
+        fleet: Fleet,
+        rho: Vec<Scalar>,
+    ) -> Result<Session<'a>, SessionError> {
+        let (local_role, sid, genesis_hash) =
+            validate_bootstrap(params, &keypair, bootstrap, &peer)?;
+        Session::new_owned(
+            params,
+            keypair,
+            local_role,
+            peer,
+            sid,
+            genesis_hash,
+            fleet,
+            rho,
+        )
+    }
+
+    pub fn params(&self) -> &'a Parameters {
+        self.params
+    }
+
+    pub fn keypair(&self) -> &IdentityKeypair {
+        self.keypair.as_ref()
+    }
+
+    pub fn peer(&self) -> &AuthenticatedPeer {
+        &self.peer
+    }
+
     pub fn sid(&self) -> &[u8; 32] {
         &self.sid
     }
 
+    pub fn genesis_hash(&self) -> &[u8; 32] {
+        &self.genesis_hash
+    }
+
     pub fn local_role(&self) -> Role {
         self.local_role
+    }
+
+    pub fn first_mover(&self) -> Option<Role> {
+        self.first_mover
+    }
+
+    /// Packed `[u8; 3 * K]` fleet encoding while board secrets are still held.
+    pub fn own_fleet_bytes(&self) -> Option<Zeroizing<[u8; 3 * K]>> {
+        match &self.phase {
+            Phase::Commit(cp) => cp.own.fleet.as_ref().map(Fleet::to_bytes),
+            Phase::Coin(cp) => cp
+                .game
+                .as_ref()
+                .and_then(|g| g.snapshot_secrets().map(|s| Zeroizing::new(s.fleet_bytes)))
+                .or_else(|| cp.own.fleet.as_ref().map(Fleet::to_bytes)),
+            Phase::Playing(game) => game
+                .snapshot_secrets()
+                .map(|s| Zeroizing::new(s.fleet_bytes)),
+            Phase::Finished { .. } | Phase::Aborted => None,
+        }
+    }
+
+    pub fn phase_kind(&self) -> PhaseKind {
+        match &self.phase {
+            Phase::Commit(_) => PhaseKind::Commit,
+            Phase::Coin(_) => PhaseKind::Coin,
+            Phase::Playing(_) => PhaseKind::Playing,
+            Phase::Finished { .. } => PhaseKind::Finished,
+            Phase::Aborted => PhaseKind::Aborted,
+        }
+    }
+
+    pub fn needs_produce(&self) -> bool {
+        if self.expected_sender() != Some(self.local_role) {
+            return false;
+        }
+        matches!(self.phase, Phase::Commit(_) | Phase::Coin(_))
+    }
+
+    pub fn can_fire_shot(&self) -> bool {
+        matches!(
+            &self.phase,
+            Phase::Playing(g)
+                if matches!(g.state(), GameState::AwaitingShot { shooter } if shooter == self.local_role)
+        )
     }
 
     pub fn head_sequence(&self) -> u64 {
@@ -505,7 +694,7 @@ impl<'a> Session<'a> {
                 let rho = cp.own.rho.as_ref().expect("witness present");
                 setup::prove_with_rng(
                     self.params,
-                    self.keypair.peer_key().as_bytes(),
+                    self.keypair.as_ref().peer_key().as_bytes(),
                     &self.sid,
                     fleet,
                     rho.as_slice(),
@@ -519,7 +708,7 @@ impl<'a> Session<'a> {
             let mut answer_seed = Zeroizing::new([0u8; 32]);
             rng.fill_bytes(&mut *answer_seed);
             let frame = craft_next(
-                self.keypair,
+                self.keypair.as_ref(),
                 &self.sid,
                 self.local_role,
                 &mut self.head,
@@ -546,7 +735,7 @@ impl<'a> Session<'a> {
         let coin_action = match &mut self.phase {
             Phase::Coin(cp) => match cp.step {
                 CoinStep::Commit if self.local_role == Role::A => {
-                    let r_a = coin::sample_nonce(rng);
+                    let r_a = Zeroizing::new(coin::sample_nonce(rng));
                     let commitment = coin::coin_commit(&self.sid, &r_a);
                     cp.r_a = Some(r_a);
                     cp.coin_commit = Some(commitment);
@@ -569,7 +758,7 @@ impl<'a> Session<'a> {
         };
         if let Some((message_type, payload)) = coin_action {
             let frame = craft_next(
-                self.keypair,
+                self.keypair.as_ref(),
                 &self.sid,
                 self.local_role,
                 &mut self.head,
@@ -591,7 +780,7 @@ impl<'a> Session<'a> {
         };
         let byte = game.fire_shot(cell).map_err(SessionError::LocalGame)?;
         Ok(craft_next(
-            self.keypair,
+            self.keypair.as_ref(),
             &self.sid,
             self.local_role,
             &mut self.head,
@@ -609,7 +798,7 @@ impl<'a> Session<'a> {
             ));
         }
         let frame = craft_next(
-            self.keypair,
+            self.keypair.as_ref(),
             &self.sid,
             self.local_role,
             &mut self.head,
@@ -730,11 +919,12 @@ impl<'a> Session<'a> {
                     if self.local_role == Role::A {
                         let r_a = cp.r_a.as_ref().expect("A sampled r_A");
                         let first_mover = coin::first_mover(&self.sid, r_a, &r_b);
+                        self.first_mover = Some(first_mover);
                         let game = build_game(
                             self.params,
                             self.local_role,
                             first_mover,
-                            game_context(self.keypair, &self.peer, &self.sid),
+                            game_context(self.keypair.as_ref(), &self.peer, &self.sid),
                             &mut cp.own,
                             &mut cp.peer_verified,
                         )?;
@@ -759,11 +949,12 @@ impl<'a> Session<'a> {
                         &r_a,
                         cp.r_b.as_ref().expect("nonce received"),
                     );
+                    self.first_mover = Some(first_mover);
                     let game = build_game(
                         self.params,
                         self.local_role,
                         first_mover,
-                        game_context(self.keypair, &self.peer, &self.sid),
+                        game_context(self.keypair.as_ref(), &self.peer, &self.sid),
                         &mut cp.own,
                         &mut cp.peer_verified,
                     )?;
@@ -801,7 +992,7 @@ impl<'a> Session<'a> {
                     };
                     advance_chain(&mut self.head, &mut self.transcript, &frame);
                     let answer_frame = craft_next(
-                        self.keypair,
+                        self.keypair.as_ref(),
                         &self.sid,
                         self.local_role,
                         &mut self.head,
@@ -875,6 +1066,550 @@ impl<'a> Session<'a> {
             None => {}
         }
         outcome
+    }
+
+    /// Exports an active (non-finished, non-aborted) session and its secret
+    /// state for crash/reload recovery. Caller must keep the bytes secret.
+    pub fn export_snapshot(&self) -> Result<Zeroizing<Vec<u8>>, SessionError> {
+        struct SnapshotParts {
+            fleet_bytes: Zeroizing<[u8; 3 * K]>,
+            rho: Zeroizing<Vec<Scalar>>,
+            answer_seed: Option<Zeroizing<[u8; 32]>>,
+            r_a: Option<Zeroizing<[u8; 32]>>,
+        }
+        let parts = match &self.phase {
+            Phase::Commit(cp) => {
+                let fleet = cp
+                    .own
+                    .fleet
+                    .as_ref()
+                    .ok_or(SessionError::InternalInvariant("missing fleet witness"))?;
+                let rho = cp
+                    .own
+                    .rho
+                    .as_ref()
+                    .ok_or(SessionError::InternalInvariant("missing blinder witness"))?;
+                SnapshotParts {
+                    fleet_bytes: fleet.to_bytes(),
+                    rho: rho.clone(),
+                    answer_seed: cp.own.answer_seed.clone(),
+                    r_a: None,
+                }
+            }
+            Phase::Coin(cp) => {
+                if let Some(game) = &cp.game {
+                    let secrets =
+                        game.snapshot_secrets()
+                            .ok_or(SessionError::InternalInvariant(
+                                "missing game secrets in coin phase",
+                            ))?;
+                    SnapshotParts {
+                        fleet_bytes: Zeroizing::new(secrets.fleet_bytes),
+                        rho: Zeroizing::new(secrets.rho.clone()),
+                        answer_seed: Some(Zeroizing::new(secrets.answer_seed)),
+                        r_a: cp.r_a.clone(),
+                    }
+                } else {
+                    let fleet = cp
+                        .own
+                        .fleet
+                        .as_ref()
+                        .ok_or(SessionError::InternalInvariant("missing fleet witness"))?;
+                    let rho = cp
+                        .own
+                        .rho
+                        .as_ref()
+                        .ok_or(SessionError::InternalInvariant("missing blinder witness"))?;
+                    SnapshotParts {
+                        fleet_bytes: fleet.to_bytes(),
+                        rho: rho.clone(),
+                        answer_seed: cp.own.answer_seed.clone(),
+                        r_a: cp.r_a.clone(),
+                    }
+                }
+            }
+            Phase::Playing(game) => {
+                let secrets = game
+                    .snapshot_secrets()
+                    .ok_or(SessionError::InternalInvariant(
+                        "missing game secrets in playing phase",
+                    ))?;
+                SnapshotParts {
+                    fleet_bytes: Zeroizing::new(secrets.fleet_bytes),
+                    rho: Zeroizing::new(secrets.rho.clone()),
+                    answer_seed: Some(Zeroizing::new(secrets.answer_seed)),
+                    r_a: None,
+                }
+            }
+            Phase::Finished { .. } | Phase::Aborted => {
+                return Err(SessionError::WrongLocalState(
+                    "finished or aborted session cannot be snapshotted",
+                ));
+            }
+        };
+        let SnapshotParts {
+            fleet_bytes,
+            rho,
+            answer_seed,
+            r_a,
+        } = parts;
+        if rho.len() != SHIP_BITS {
+            return Err(SessionError::InternalInvariant(
+                "corrupt snapshot rho length",
+            ));
+        }
+        let mut out = Zeroizing::new(Vec::with_capacity(
+            128 + 32 * SHIP_BITS + self.transcript.iter().map(|f| 4 + f.len()).sum::<usize>(),
+        ));
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.push(match self.params.rules() {
+            Rules::Standard => 0,
+            Rules::NoTouch => 1,
+        });
+        out.push(frame::role_to_byte(self.local_role));
+        out.extend_from_slice(self.peer.key().as_bytes());
+        out.extend_from_slice(&self.sid);
+        out.extend_from_slice(&self.genesis_hash);
+        out.extend_from_slice(&*fleet_bytes);
+        for s in rho.iter() {
+            out.extend_from_slice(s.as_bytes());
+        }
+        match answer_seed {
+            Some(seed) => {
+                out.push(1);
+                out.extend_from_slice(&*seed);
+            }
+            None => out.push(0),
+        }
+        match r_a {
+            Some(nonce) => {
+                out.push(1);
+                out.extend_from_slice(&*nonce);
+            }
+            None => out.push(0),
+        }
+        let frame_count = u32::try_from(self.transcript.len())
+            .map_err(|_| SessionError::InternalInvariant("transcript exceeds u32"))?;
+        out.extend_from_slice(&frame_count.to_le_bytes());
+        for raw in &self.transcript {
+            let len = u32::try_from(raw.len())
+                .map_err(|_| SessionError::InternalInvariant("frame exceeds u32"))?;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(raw);
+        }
+        Ok(out)
+    }
+
+    /// Restores an active [`Session`] from bytes produced by [`Session::export_snapshot`],
+    /// taking ownership of `keypair`.
+    pub fn restore_snapshot_owned(
+        params: &'a Parameters,
+        keypair: IdentityKeypair,
+        peer: AuthenticatedPeer,
+        snapshot: &[u8],
+    ) -> Result<Session<'a>, SessionError> {
+        Self::restore_snapshot_with_keypair(
+            params,
+            KeypairRef::Owned(Box::new(keypair)),
+            peer,
+            snapshot,
+        )
+    }
+
+    /// Restores an active [`Session`] from bytes produced by [`Session::export_snapshot`],
+    /// re-verifying signatures, setup proofs, coin flip, and play history.
+    pub fn restore_snapshot(
+        params: &'a Parameters,
+        keypair: &'a IdentityKeypair,
+        peer: AuthenticatedPeer,
+        snapshot: &[u8],
+    ) -> Result<Session<'a>, SessionError> {
+        Self::restore_snapshot_with_keypair(params, KeypairRef::Borrowed(keypair), peer, snapshot)
+    }
+
+    fn restore_snapshot_with_keypair(
+        params: &'a Parameters,
+        keypair: KeypairRef<'a>,
+        peer: AuthenticatedPeer,
+        snapshot: &[u8],
+    ) -> Result<Session<'a>, SessionError> {
+        let mut cur = SnapshotReader::new(snapshot);
+        if cur.take_array::<8>()? != *SNAPSHOT_MAGIC {
+            return Err(SessionError::WrongLocalState("invalid snapshot header"));
+        }
+        let rules = match cur.take_u8()? {
+            0 => Rules::Standard,
+            1 => Rules::NoTouch,
+            _ => return Err(SessionError::WrongLocalState("unknown snapshot rules")),
+        };
+        if rules != params.rules() {
+            return Err(SessionError::WrongLocalState("snapshot rules mismatch"));
+        }
+        let local_role = frame::role_from_byte(cur.take_u8()?)
+            .ok_or(SessionError::WrongLocalState("invalid snapshot role"))?;
+        let peer_bytes = cur.take_array::<32>()?;
+        if &peer_bytes != peer.key().as_bytes() {
+            return Err(SessionError::WrongLocalState("snapshot peer key mismatch"));
+        }
+        let sid = cur.take_array::<32>()?;
+        let genesis_hash = cur.take_array::<32>()?;
+        let fleet_bytes = Zeroizing::new(cur.take_array::<{ 3 * K }>()?);
+        let fleet = Fleet::from_bytes(&fleet_bytes, params.rules())
+            .map_err(|e| SessionError::LocalGame(GameError::IllegalPlacement(e)))?;
+        let mut rho = Zeroizing::new(Vec::with_capacity(SHIP_BITS));
+        for _ in 0..SHIP_BITS {
+            let scalar_bytes = cur.take_array::<32>()?;
+            let s = Option::from(Scalar::from_canonical_bytes(scalar_bytes)).ok_or(
+                SessionError::WrongLocalState("non-canonical scalar in snapshot"),
+            )?;
+            rho.push(s);
+        }
+        let answer_seed = match cur.take_u8()? {
+            0 => None,
+            1 => Some(Zeroizing::new(cur.take_array::<32>()?)),
+            _ => {
+                return Err(SessionError::WrongLocalState(
+                    "invalid snapshot answer_seed flag",
+                ))
+            }
+        };
+        let mut r_a = match cur.take_u8()? {
+            0 => None,
+            1 => Some(Zeroizing::new(cur.take_array::<32>()?)),
+            _ => return Err(SessionError::WrongLocalState("invalid snapshot r_a flag")),
+        };
+        let frame_count = cur.take_u32()? as usize;
+        if frame_count > MAX_TRANSCRIPT_FRAMES {
+            return Err(SessionError::WrongLocalState(
+                "snapshot frame count out of bounds",
+            ));
+        }
+        let mut frames = Vec::with_capacity(frame_count);
+        for _ in 0..frame_count {
+            let len = cur.take_u32()? as usize;
+            if len > MAX_FRAME_SIZE {
+                return Err(SessionError::WrongLocalState(
+                    "snapshot frame exceeds max size",
+                ));
+            }
+            frames.push(cur.take_slice(len)?);
+        }
+        if !cur.is_empty() {
+            return Err(SessionError::WrongLocalState("trailing bytes in snapshot"));
+        }
+
+        // Precompute our own ship commitments to bind local Commit frames to the secret witness.
+        let bits = fleet.ship_bits();
+        let identity = RistrettoPoint::identity();
+        let expected_ship_cells: Vec<RistrettoPoint> = (0..SHIP_BITS)
+            .map(|k| {
+                params.h_table() * &rho[k]
+                    + RistrettoPoint::conditional_select(
+                        &identity,
+                        params.g(),
+                        Choice::from(bits[k] & 1),
+                    )
+            })
+            .collect();
+        let own_cell_commitments = setup::cell_commitments(&expected_ship_cells);
+
+        let own_key_pair = keypair.as_ref().peer_key();
+        let own_auth = AuthenticatedPeer::from_policy_decision(own_key_pair);
+        let mut session = Session::new_with_keypair(
+            params,
+            keypair,
+            local_role,
+            peer,
+            sid,
+            genesis_hash,
+            fleet,
+            rho.to_vec(),
+        )?;
+        let local_role_byte = frame::role_to_byte(local_role);
+
+        // In Phase::Playing, r_a was consumed on CoinReveal; recover it from that public frame so
+        // replaying CoinNonce/CoinReveal can verify the coin flip identically.
+        let decoded_frames: Vec<SignedFrame> = frames
+            .iter()
+            .map(|raw| {
+                SignedFrame::decode(raw)
+                    .map_err(|_| SessionError::WrongLocalState("malformed frame in snapshot"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if r_a.is_none() && local_role == Role::A {
+            for f in &decoded_frames {
+                if f.header().message_type == MessageType::CoinReveal
+                    && f.header().sender_role == local_role_byte
+                {
+                    let bytes: [u8; 32] = f
+                        .payload()
+                        .try_into()
+                        .map_err(|_| SessionError::WrongLocalState("bad CoinReveal payload"))?;
+                    r_a = Some(Zeroizing::new(bytes));
+                    break;
+                }
+            }
+        }
+
+        for frame in decoded_frames {
+            let expectation = ChainExpectation {
+                sid: session.sid,
+                sequence: session.head.sequence + 1,
+                prev_hash: session.head.hash,
+            };
+            if frame.header().sender_role == local_role_byte {
+                let auth = frame.authenticate(&expectation, &own_auth).map_err(|_| {
+                    SessionError::WrongLocalState("snapshot local frame failed auth")
+                })?;
+                let msg_type = auth.frame().header().message_type;
+                let payload = auth.frame().payload();
+                match (&mut session.phase, msg_type) {
+                    (Phase::Commit(cp), MessageType::Commit) => {
+                        let expected_sender = if cp.a_done { Role::B } else { Role::A };
+                        if expected_sender != local_role {
+                            return Err(SessionError::WrongLocalState("out-of-turn local Commit"));
+                        }
+                        let msg = SetupMessage::decode(payload, params.rules()).map_err(|_| {
+                            SessionError::WrongLocalState("invalid local Commit encoding")
+                        })?;
+                        let verified =
+                            setup::verify(params, own_key_pair.as_bytes(), &session.sid, &msg)
+                                .map_err(|_| {
+                                    SessionError::WrongLocalState(
+                                        "local Commit proof failed verification",
+                                    )
+                                })?;
+                        if verified.ship_cells() != expected_ship_cells.as_slice() {
+                            return Err(SessionError::WrongLocalState(
+                                "snapshot witness does not match committed ship cells",
+                            ));
+                        }
+                        let seed = answer_seed.clone().ok_or(SessionError::WrongLocalState(
+                            "snapshot missing answer_seed after local Commit",
+                        ))?;
+                        cp.own.ship_cells = Some(msg.ship_cells);
+                        cp.own.answer_seed = Some(seed);
+                        match local_role {
+                            Role::A => cp.a_done = true,
+                            Role::B => cp.b_done = true,
+                        }
+                        let to_coin = cp.a_done && cp.b_done;
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                        if to_coin {
+                            session.enter_coin_phase();
+                        }
+                    }
+                    (Phase::Coin(cp), MessageType::CoinCommit)
+                        if cp.step == CoinStep::Commit && local_role == Role::A =>
+                    {
+                        let commitment: [u8; 32] = payload.try_into().map_err(|_| {
+                            SessionError::WrongLocalState("bad local CoinCommit payload")
+                        })?;
+                        let ra = r_a.clone().ok_or(SessionError::WrongLocalState(
+                            "snapshot missing r_A for CoinCommit",
+                        ))?;
+                        if !coin::verify_reveal(&session.sid, &commitment, &ra) {
+                            return Err(SessionError::WrongLocalState(
+                                "snapshot r_A does not match CoinCommit",
+                            ));
+                        }
+                        cp.coin_commit = Some(commitment);
+                        cp.r_a = Some(ra);
+                        cp.step = CoinStep::Nonce;
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                    }
+                    (Phase::Coin(cp), MessageType::CoinNonce)
+                        if cp.step == CoinStep::Nonce && local_role == Role::B =>
+                    {
+                        let rb: [u8; 32] = payload.try_into().map_err(|_| {
+                            SessionError::WrongLocalState("bad local CoinNonce payload")
+                        })?;
+                        cp.r_b = Some(rb);
+                        cp.step = CoinStep::Reveal;
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                    }
+                    (Phase::Coin(cp), MessageType::CoinReveal)
+                        if cp.step == CoinStep::Reveal && local_role == Role::A =>
+                    {
+                        let ra_bytes: [u8; 32] = payload.try_into().map_err(|_| {
+                            SessionError::WrongLocalState("bad local CoinReveal payload")
+                        })?;
+                        let expected_ra = cp.r_a.take().ok_or(SessionError::WrongLocalState(
+                            "missing r_A during CoinReveal replay",
+                        ))?;
+                        if ra_bytes != *expected_ra {
+                            return Err(SessionError::WrongLocalState("CoinReveal mismatch"));
+                        }
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                        session.enter_playing_phase();
+                    }
+                    (Phase::Playing(game), MessageType::Shot) => {
+                        let cell = CellIndex::from_index(payload[0]).ok_or(
+                            SessionError::WrongLocalState("invalid local Shot cell in snapshot"),
+                        )?;
+                        game.fire_shot(cell).map_err(|_| {
+                            SessionError::WrongLocalState("local Shot invalid for restored game")
+                        })?;
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                    }
+                    (Phase::Playing(game), MessageType::Answer) => {
+                        let GameState::AwaitingAnswer { shooter, cell } = game.state() else {
+                            return Err(SessionError::WrongLocalState(
+                                "unexpected local Answer in snapshot",
+                            ));
+                        };
+                        if shooter == local_role {
+                            return Err(SessionError::WrongLocalState(
+                                "local Answer while local Shot pending",
+                            ));
+                        }
+                        let answer = ShotAnswer::decode(
+                            payload,
+                            game.shots_on_board(local_role).unsunk_count(),
+                        )
+                        .map_err(|_| {
+                            SessionError::WrongLocalState("invalid local Answer encoding")
+                        })?;
+                        let ctx = AnswerContext {
+                            defender_id: own_key_pair.as_bytes(),
+                            sid: &session.sid,
+                        };
+                        answers::verify_answer(
+                            params,
+                            &ctx,
+                            &expected_ship_cells,
+                            &own_cell_commitments,
+                            game.shots_on_board(local_role),
+                            cell,
+                            &answer,
+                        )
+                        .map_err(|_| {
+                            SessionError::WrongLocalState("local Answer failed verification")
+                        })?;
+                        game.replay_own_answer(&answer).map_err(|_| {
+                            SessionError::WrongLocalState("local Answer replay failed")
+                        })?;
+                        advance_chain(&mut session.head, &mut session.transcript, &auth);
+                    }
+                    _ => {
+                        return Err(SessionError::WrongLocalState(
+                            "unexpected local frame in snapshot",
+                        ));
+                    }
+                }
+            } else {
+                let auth = frame
+                    .authenticate(&expectation, &session.peer)
+                    .map_err(|_| {
+                        SessionError::WrongLocalState("snapshot peer frame failed auth")
+                    })?;
+                if auth.frame().header().sender_role != frame::role_to_byte(local_role.other()) {
+                    return Err(SessionError::WrongLocalState(
+                        "snapshot peer frame has wrong sender role",
+                    ));
+                }
+                let is_playing_shot = matches!(session.phase, Phase::Playing(_))
+                    && auth.frame().header().message_type == MessageType::Shot;
+                if is_playing_shot {
+                    let cell_byte = auth.frame().payload()[0];
+                    let Phase::Playing(game) = &mut session.phase else {
+                        unreachable!()
+                    };
+                    game.receive_shot(cell_byte).map_err(|_| {
+                        SessionError::WrongLocalState("invalid peer Shot in snapshot")
+                    })?;
+                    advance_chain(&mut session.head, &mut session.transcript, &auth);
+                } else {
+                    session.accept_authenticated(auth).map_err(|_| {
+                        SessionError::WrongLocalState("snapshot peer frame failed protocol check")
+                    })?;
+                }
+            }
+        }
+
+        match &session.phase {
+            Phase::Finished { .. } | Phase::Aborted => {
+                return Err(SessionError::WrongLocalState(
+                    "restored snapshot is already finished or aborted",
+                ));
+            }
+            Phase::Playing(game) => {
+                if matches!(
+                    game.state(),
+                    GameState::AwaitingAnswer { shooter, .. } if shooter != local_role
+                ) {
+                    return Err(SessionError::WrongLocalState(
+                        "snapshot ends with unanswered peer shot",
+                    ));
+                }
+            }
+            Phase::Commit(_) | Phase::Coin(_) => {}
+        }
+        Ok(session)
+    }
+}
+
+fn validate_bootstrap(
+    params: &Parameters,
+    keypair: &IdentityKeypair,
+    bootstrap: &SessionBootstrap,
+    peer: &AuthenticatedPeer,
+) -> Result<(Role, [u8; 32], [u8; 32]), SessionError> {
+    if bootstrap.params_id() != params.params_id() {
+        return Err(SessionError::WrongLocalState(
+            "bootstrap params_id does not match session parameters",
+        ));
+    }
+    let own_key = keypair.peer_key();
+    let local_role = bootstrap
+        .try_role_of(&own_key)
+        .ok_or(SessionError::WrongLocalState(
+            "local identity key is not part of bootstrap",
+        ))?;
+    if bootstrap.peer_key_for(&own_key) != Some(peer.key()) {
+        return Err(SessionError::WrongLocalState(
+            "authenticated peer key does not match bootstrap",
+        ));
+    }
+    Ok((local_role, *bootstrap.sid(), *bootstrap.genesis_hash()))
+}
+
+const SNAPSHOT_MAGIC: &[u8; 8] = b"ZKBSS01\0";
+
+struct SnapshotReader<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> SnapshotReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    fn take_slice(&mut self, len: usize) -> Result<&'a [u8], SessionError> {
+        if self.buf.len() < len {
+            return Err(SessionError::WrongLocalState("truncated snapshot"));
+        }
+        let (head, rest) = self.buf.split_at(len);
+        self.buf = rest;
+        Ok(head)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, SessionError> {
+        Ok(self.take_slice(1)?[0])
+    }
+
+    fn take_u32(&mut self) -> Result<u32, SessionError> {
+        let bytes = self.take_array::<4>()?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], SessionError> {
+        let slice = self.take_slice(N)?;
+        Ok(slice.try_into().expect("length checked"))
     }
 }
 
@@ -1425,5 +2160,236 @@ mod tests {
                 winner: current.other()
             }
         );
+    }
+
+    #[test]
+    fn session_from_bootstrap_and_self_key_rejection() {
+        let params = Parameters::standard();
+        let params_id = *params.params_id();
+        let ka = keypair(0x11);
+        let kb = keypair(0x22);
+        let mut r = rng(0x33);
+
+        // Same key as both local and peer must be rejected.
+        assert!(matches!(
+            Session::new(
+                params,
+                &ka,
+                Role::A,
+                auth(&ka),
+                SID,
+                GENESIS,
+                placement_a(),
+                blinders(0xA0),
+            ),
+            Err(SessionError::WrongLocalState(_))
+        ));
+
+        let ha = hello::Hello::create(&ka, params_id, &mut r);
+        let hb = hello::Hello::create(&kb, params_id, &mut r);
+        let ca = hello::check_hello(ha, &params_id, &ExpectedKey::new(ka.peer_key())).unwrap();
+        let cb = hello::check_hello(hb, &params_id, &ExpectedKey::new(kb.peer_key())).unwrap();
+        let bootstrap = hello::complete_bootstrap(ca, cb).unwrap();
+        let (a_key, b_key) = if bootstrap.role_of(&ka.peer_key()) == Role::A {
+            (&ka, &kb)
+        } else {
+            (&kb, &ka)
+        };
+        let s = Session::from_bootstrap(
+            params,
+            a_key,
+            &bootstrap,
+            auth(b_key),
+            placement_a(),
+            blinders(0xA0),
+        )
+        .unwrap();
+        assert_eq!(s.local_role(), Role::A);
+        assert_eq!(s.phase_kind(), PhaseKind::Commit);
+        assert!(s.needs_produce());
+        assert!(!s.can_fire_shot());
+
+        // Mismatched peer key rejected.
+        let kc = keypair(0x33);
+        assert!(matches!(
+            Session::from_bootstrap(
+                params,
+                a_key,
+                &bootstrap,
+                auth(&kc),
+                placement_a(),
+                blinders(0xA0),
+            ),
+            Err(SessionError::WrongLocalState(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_restore_mid_game_matches_uninterrupted_answers() {
+        let params = Parameters::standard();
+        let ka = keypair(0x11);
+        let kb = keypair(0x22);
+        let mut r = rng(0x55);
+
+        let mut sa = session(&ka, Role::A, &kb);
+        let mut sb = Session::new(
+            params,
+            &kb,
+            Role::B,
+            auth(&ka),
+            SID,
+            GENESIS,
+            placement_b(),
+            blinders(0xB0),
+        )
+        .unwrap();
+
+        // Snapshot before any commit, then restore and continue.
+        let snap0 = sa.export_snapshot().unwrap();
+        sa = Session::restore_snapshot(params, &ka, auth(&kb), &snap0).unwrap();
+
+        let f = sa.produce(&mut r).unwrap().unwrap();
+        sb.accept(f.bytes()).unwrap();
+        // Snapshot A right after sending Commit, and B before sending Commit.
+        let snap_a1 = sa.export_snapshot().unwrap();
+        let snap_b1 = sb.export_snapshot().unwrap();
+        sa = Session::restore_snapshot(params, &ka, auth(&kb), &snap_a1).unwrap();
+        sb = Session::restore_snapshot(params, &kb, auth(&ka), &snap_b1).unwrap();
+
+        let f = sb.produce(&mut r).unwrap().unwrap();
+        sa.accept(f.bytes()).unwrap();
+        let f = sa.produce(&mut r).unwrap().unwrap(); // CoinCommit
+        sb.accept(f.bytes()).unwrap();
+        let f = sb.produce(&mut r).unwrap().unwrap(); // CoinNonce
+        sa.accept(f.bytes()).unwrap();
+
+        // Snapshot A right between CoinNonce and CoinReveal (game already initialized, r_A held).
+        let snap_coin = sa.export_snapshot().unwrap();
+        sa = Session::restore_snapshot(params, &ka, auth(&kb), &snap_coin).unwrap();
+
+        let f = sa.produce(&mut r).unwrap().unwrap(); // CoinReveal
+        let AcceptOutcome::GameReady { first_mover } = sb.accept(f.bytes()).unwrap() else {
+            panic!("expected GameReady");
+        };
+        assert_eq!(sa.first_mover(), Some(first_mover));
+        assert_eq!(sb.first_mover(), Some(first_mover));
+
+        // Play a few turns including hits, misses, and a sink, then snapshot both sides
+        // and verify restored sessions produce byte-for-byte identical answers and finish.
+        let mut current = first_mover;
+        for turn in 0..24 {
+            let (attacker, defender) = if current == Role::A {
+                (&mut sa, &mut sb)
+            } else {
+                (&mut sb, &mut sa)
+            };
+            let cell = (0..100u8)
+                .map(|i| CellIndex::from_index(i).unwrap())
+                .find(|c| {
+                    !attacker
+                        .game()
+                        .unwrap()
+                        .shots_on_board(current.other())
+                        .is_shot(*c)
+                })
+                .unwrap();
+            let shot = attacker.fire_shot(cell).unwrap();
+            if turn == 12 {
+                // Also test snapshot when local player has a pending shot out.
+                let (key, peer) = if current == Role::A {
+                    (&ka, auth(&kb))
+                } else {
+                    (&kb, auth(&ka))
+                };
+                let snap = attacker.export_snapshot().unwrap();
+                *attacker = Session::restore_snapshot(params, key, peer, &snap).unwrap();
+            }
+            let AcceptOutcome::ShotReceived { answer, winner, .. } =
+                defender.accept(shot.bytes()).unwrap()
+            else {
+                panic!("expected ShotReceived");
+            };
+            attacker.accept(answer.bytes()).unwrap();
+            if winner.is_some() {
+                break;
+            }
+            current = current.other();
+        }
+
+        // Snapshot both mid-game, restore into clones, and compare the next hit proof byte-for-byte.
+        let snap_a = sa.export_snapshot().unwrap();
+        let snap_b = sb.export_snapshot().unwrap();
+        let mut sa_restored = Session::restore_snapshot(params, &ka, auth(&kb), &snap_a).unwrap();
+        let mut sb_restored = Session::restore_snapshot(params, &kb, auth(&ka), &snap_b).unwrap();
+
+        let (orig_att, orig_def, rest_att, rest_def) = if current == Role::A {
+            (&mut sa, &mut sb, &mut sa_restored, &mut sb_restored)
+        } else {
+            (&mut sb, &mut sa, &mut sb_restored, &mut sa_restored)
+        };
+        let next_cell = (0..100u8)
+            .map(|i| CellIndex::from_index(i).unwrap())
+            .find(|c| {
+                !orig_att
+                    .game()
+                    .unwrap()
+                    .shots_on_board(current.other())
+                    .is_shot(*c)
+            })
+            .unwrap();
+        let orig_shot = orig_att.fire_shot(next_cell).unwrap();
+        let rest_shot = rest_att.fire_shot(next_cell).unwrap();
+        assert_eq!(orig_shot.bytes(), rest_shot.bytes());
+        let AcceptOutcome::ShotReceived {
+            answer: orig_ans, ..
+        } = orig_def.accept(orig_shot.bytes()).unwrap()
+        else {
+            panic!();
+        };
+        let AcceptOutcome::ShotReceived {
+            answer: rest_ans, ..
+        } = rest_def.accept(rest_shot.bytes()).unwrap()
+        else {
+            panic!();
+        };
+        assert_eq!(orig_ans.bytes(), rest_ans.bytes());
+        orig_att.accept(orig_ans.bytes()).unwrap();
+        rest_att.accept(rest_ans.bytes()).unwrap();
+
+        // Finish the restored game completely.
+        current = current.other();
+        let winner = loop {
+            let (attacker, defender) = if current == Role::A {
+                (&mut sa_restored, &mut sb_restored)
+            } else {
+                (&mut sb_restored, &mut sa_restored)
+            };
+            let cell = (0..100u8)
+                .map(|i| CellIndex::from_index(i).unwrap())
+                .find(|c| {
+                    !attacker
+                        .game()
+                        .unwrap()
+                        .shots_on_board(current.other())
+                        .is_shot(*c)
+                })
+                .unwrap();
+            let shot = attacker.fire_shot(cell).unwrap();
+            let AcceptOutcome::ShotReceived { answer, .. } = defender.accept(shot.bytes()).unwrap()
+            else {
+                panic!();
+            };
+            match attacker.accept(answer.bytes()).unwrap() {
+                AcceptOutcome::GameFinished { winner } => break winner,
+                AcceptOutcome::Answer(_) => current = current.other(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(sa_restored.winner(), Some(winner));
+        assert_eq!(sb_restored.winner(), Some(winner));
+        assert!(matches!(
+            sa_restored.export_snapshot(),
+            Err(SessionError::WrongLocalState(_))
+        ));
     }
 }

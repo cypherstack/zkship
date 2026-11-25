@@ -1,10 +1,11 @@
-//! Two-process TCP demo. Transport (length-prefixed frames) lives here, outside
-//! the crypto/game core. The transcript is public by design; use an encrypted
-//! transport if confidentiality matters.
+//! Two-process TCP demo and offline transcript verifier. Transport (length-prefixed frames)
+//! lives here, outside the crypto/game core. The transcript is public by design; use an
+//! encrypted transport if confidentiality matters.
 //!
 //! ```text
-//! zkb-cli listen  --addr 127.0.0.1:PORT [--name NAME] [--key-file PATH] [--rules RULES]
-//! zkb-cli connect --addr 127.0.0.1:PORT [--name NAME] [--key-file PATH] [--rules RULES]
+//! zkb-cli listen  --addr 127.0.0.1:PORT [--name NAME] [--key-file PATH] [--rules RULES] [--fleet HEX] [--transcript-out PATH]
+//! zkb-cli connect --addr 127.0.0.1:PORT [--name NAME] [--key-file PATH] [--rules RULES] [--fleet HEX] [--transcript-out PATH]
+//! zkb-cli verify-transcript PATH
 //! ```
 //!
 //! The fingerprint prompt is the application peer-auth hook; it is not MITM
@@ -25,7 +26,7 @@ use zeroize::Zeroizing;
 use zkb_core::fleet::{Fleet, SHIP_BITS};
 use zkb_core::game::Role;
 use zkb_core::game::ShotOutcome;
-use zkb_core::params::{CellIndex, Parameters, Rules, FLEET_LENGTHS, N, T};
+use zkb_core::params::{CellIndex, Parameters, Rules, FLEET_LENGTHS, K, N, T};
 use zkb_session::codec::MAX_FRAME_SIZE;
 use zkb_session::frame::{self, SignedFrame};
 use zkb_session::hello::{self, Hello};
@@ -33,6 +34,7 @@ use zkb_session::identity::{
     AuthenticatedPeer, ExpectedKey, IdentityKeypair, PeerAuthPolicy, PeerKey,
 };
 use zkb_session::state::{AcceptOutcome, Session, SessionError};
+use zkb_session::verify::{self, TranscriptVerdict};
 
 const AUTO_ENV: &str = "ZKB_CLI_AUTO";
 
@@ -47,21 +49,37 @@ fn main() -> ExitCode {
     }
 }
 
+enum CliAction {
+    Play(Options),
+    VerifyTranscript(String),
+}
+
 struct Options {
     listen: bool,
     addr: String,
     name: String,
     key_file: Option<String>,
     rules: Rules,
+    fleet: Option<Zeroizing<[u8; 3 * K]>>,
+    transcript_out: Option<String>,
     auto: bool,
 }
 
-fn parse_args(args: &[String]) -> Result<Options, String> {
+fn parse_action(args: &[String]) -> Result<CliAction, String> {
     let auto = env::var(AUTO_ENV).ok().as_deref() == Some("1");
     let mut iter = args.iter();
     let Some(command) = iter.next() else {
         return Err(usage());
     };
+    if command == "verify-transcript" {
+        let Some(path) = iter.next() else {
+            return Err(usage());
+        };
+        if iter.next().is_some() {
+            return Err(usage());
+        }
+        return Ok(CliAction::VerifyTranscript(path.clone()));
+    }
     let listen = match command.as_str() {
         "listen" => true,
         "connect" => false,
@@ -71,6 +89,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut name = None;
     let mut key_file = None;
     let mut rules = Rules::Standard;
+    let mut fleet_hex = None;
+    let mut transcript_out = None;
     while let Some(flag) = iter.next() {
         let Some(value) = iter.next() else {
             return Err(usage());
@@ -86,27 +106,40 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     _ => return Err(usage()),
                 }
             }
+            "--fleet" => fleet_hex = Some(value.clone()),
+            "--transcript-out" => transcript_out = Some(value.clone()),
             _ => return Err(usage()),
         }
     }
-    Ok(Options {
+    let fleet = match fleet_hex {
+        Some(raw) => Some(Zeroizing::new(parse_fleet_hex(&raw, rules)?)),
+        None => None,
+    };
+    Ok(CliAction::Play(Options {
         listen,
         addr: addr.ok_or_else(usage)?,
         name: name.unwrap_or_else(|| "player".to_string()),
         key_file,
         rules,
+        fleet,
+        transcript_out,
         auto,
-    })
+    }))
 }
 
 fn usage() -> String {
-    "usage: zkb-cli <listen|connect> --addr HOST:PORT [--name NAME] [--key-file PATH] \
-     [--rules standard|no-touch]"
+    "usage:\n  \
+     zkb-cli <listen|connect> --addr HOST:PORT [--name NAME] [--key-file PATH] \
+     [--rules standard|no-touch] [--fleet 30HEX] [--transcript-out PATH]\n  \
+     zkb-cli verify-transcript PATH"
         .to_string()
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let options = parse_args(args)?;
+    let options = match parse_action(args)? {
+        CliAction::VerifyTranscript(path) => return verify_transcript_file(&path),
+        CliAction::Play(opts) => opts,
+    };
     let params = Parameters::for_rules(options.rules);
     let keypair = load_or_create_identity(options.key_file.as_deref())?;
     println!(
@@ -124,13 +157,23 @@ fn run(args: &[String]) -> Result<(), String> {
     } else {
         TcpStream::connect(&options.addr).map_err(|e| format!("connect: {e}"))?
     };
+    let _ = stream.set_nodelay(true);
 
     let mut demo = Demo::new(params, &keypair, &options);
-    demo.bootstrap(&mut stream)?;
-    let Some(first_mover) = demo.commit_and_coin(&mut stream)? else {
-        return Ok(());
-    };
-    demo.play(&mut stream, first_mover)
+    let outcome = (|| -> Result<(), String> {
+        demo.bootstrap(&mut stream)?;
+        let Some(first_mover) = demo.commit_and_coin(&mut stream)? else {
+            return Ok(());
+        };
+        demo.play(&mut stream, first_mover)
+    })();
+
+    if let Some(path) = options.transcript_out.as_deref() {
+        if let Err(e) = demo.write_public_transcript(path) {
+            eprintln!("warning: failed to write transcript {path}: {e}");
+        }
+    }
+    outcome
 }
 
 /// Application auth hook: interactive fingerprint confirmation (auto in scripted mode).
@@ -147,10 +190,9 @@ impl PeerAuthPolicy for ConfirmPolicy {
         }
         println!("peer identity fingerprint: {mark}");
         println!("compare it with your peer out of band, then confirm.");
-        if matches!(
-            prompt_line("confirm peer identity? [y/N] ").as_deref(),
-            Some("y")
-        ) {
+        let confirmed = prompt_line("confirm peer identity? [y/N] ")
+            .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "y" | "yes"));
+        if confirmed {
             Some(AuthenticatedPeer::from_policy_decision(*announced))
         } else {
             None
@@ -163,8 +205,11 @@ struct Demo<'a> {
     keypair: &'a IdentityKeypair,
     name: String,
     auto: bool,
+    fleet_bytes: Option<Zeroizing<[u8; 3 * K]>>,
     session: Option<Session<'a>>,
-    placement: Vec<bool>,
+    hello_pair: Option<(Vec<u8>, Vec<u8>)>,
+    evidence_frame: Option<Vec<u8>>,
+    placement: Zeroizing<Vec<bool>>,
     shots_against: Vec<bool>,
     // None = unshot, Some(false) = miss, Some(true) = hit.
     tracking: Vec<Option<bool>>,
@@ -177,8 +222,11 @@ impl<'a> Demo<'a> {
             keypair,
             name: options.name.clone(),
             auto: options.auto,
+            fleet_bytes: options.fleet.clone(),
             session: None,
-            placement: vec![false; N],
+            hello_pair: None,
+            evidence_frame: None,
+            placement: Zeroizing::new(vec![false; N]),
             shots_against: vec![false; N],
             tracking: vec![None; N],
         }
@@ -193,7 +241,8 @@ impl<'a> Demo<'a> {
     fn bootstrap(&mut self, stream: &mut TcpStream) -> Result<(), String> {
         let params_id = *self.params.params_id();
         let hello = Hello::create(self.keypair, params_id, &mut OsRng);
-        send_bytes(stream, &hello.encode())?;
+        let own_hello_bytes = hello.encode();
+        send_bytes(stream, &own_hello_bytes)?;
         let peer_bytes = recv_bytes(stream, Hello::LEN)?;
         let peer_hello = Hello::decode(&peer_bytes).map_err(|e| format!("peer hello: {e}"))?;
 
@@ -210,9 +259,18 @@ impl<'a> Demo<'a> {
         let bootstrap = hello::complete_bootstrap(checked_own, checked_peer)
             .map_err(|e| format!("bootstrap: {e}"))?;
         let local_role = bootstrap.role_of(&self.keypair.peer_key());
+        self.hello_pair = Some(match local_role {
+            Role::A => (own_hello_bytes, peer_bytes),
+            Role::B => (peer_bytes, own_hello_bytes),
+        });
 
-        let fleet = Fleet::random(&mut OsRng, self.params.rules());
-        self.placement = fleet.occupied().to_vec();
+        let fleet = match self.fleet_bytes.take() {
+            Some(bytes) => {
+                Fleet::from_bytes(&bytes, self.params.rules()).map_err(|e| format!("fleet: {e}"))?
+            }
+            None => Fleet::random(&mut OsRng, self.params.rules()),
+        };
+        self.placement = Zeroizing::new(fleet.occupied().to_vec());
         let blinders: Vec<Scalar> = (0..SHIP_BITS).map(|_| Scalar::random(&mut OsRng)).collect();
         let session = Session::new(
             self.params,
@@ -317,6 +375,7 @@ impl<'a> Demo<'a> {
                         return Ok(());
                     }
                     Command::Quit => {
+                        self.session().abort();
                         println!(
                             "[{}] quitting mid-session: this is class-C disconnection, \
                              not attributable evidence",
@@ -369,16 +428,49 @@ impl<'a> Demo<'a> {
                 "class-B input (non-extending/replayed/unauthenticated/corrupt; \
                  not evidence of peer cheating): {reason}"
             )),
-            Err(SessionError::Attributable(violation)) => Err(format!(
-                "ATTRIBUTABLE peer violation: {}; evidence frame hash {}",
-                violation.violation,
-                hex(&frame::frame_hash(violation.frame.bytes()))
-            )),
+            Err(SessionError::Attributable(violation)) => {
+                self.evidence_frame = Some(violation.frame.bytes().to_vec());
+                Err(format!(
+                    "ATTRIBUTABLE peer violation: {}; evidence frame hash {}",
+                    violation.violation,
+                    hex(&frame::frame_hash(violation.frame.bytes()))
+                ))
+            }
             Err(SessionError::InternalInvariant(what)) => {
                 Err(format!("class-D internal invariant failure: {what}"))
             }
             Err(e) => Err(format!("session error: {e}")),
         }
+    }
+
+    fn write_public_transcript(&self, path: &str) -> Result<(), String> {
+        let Some((hello_a, hello_b)) = &self.hello_pair else {
+            return Ok(());
+        };
+        let Some(session) = &self.session else {
+            return Ok(());
+        };
+        let mut out = String::new();
+        let rules_str = match self.params.rules() {
+            Rules::Standard => "standard",
+            Rules::NoTouch => "no-touch",
+        };
+        out.push_str("# zkbattleship public transcript\n");
+        out.push_str(&format!("rules = {rules_str}\n"));
+        out.push_str(&format!("params_id = {}\n", hex(self.params.params_id())));
+        out.push_str(&format!("hello_a = {}\n", hex(hello_a)));
+        out.push_str(&format!("hello_b = {}\n", hex(hello_b)));
+        out.push_str(&format!("sid = {}\n", hex(session.sid())));
+        out.push_str(&format!("genesis_hash = {}\n", hex(session.genesis_hash())));
+        for (i, frame) in session.transcript().iter().enumerate() {
+            out.push_str(&format!("frame[{i:04}] = {}\n", hex(frame)));
+        }
+        if let Some(evidence) = &self.evidence_frame {
+            out.push_str(&format!("evidence_frame = {}\n", hex(evidence)));
+        }
+        std::fs::write(path, out).map_err(|e| format!("write {path}: {e}"))?;
+        println!("[{}] wrote public transcript to {path}", self.name);
+        Ok(())
     }
 
     fn record_answer(&mut self, cell: CellIndex, outcome: ShotOutcome) {
@@ -550,13 +642,219 @@ fn load_or_create_identity(key_file: Option<&str>) -> Result<IdentityKeypair, St
 
 /// "B5": row letter A-J (A = 0), column digit 0-9.
 fn parse_cell(input: &str) -> Option<CellIndex> {
-    let mut chars = input.trim().chars();
-    let row = chars.next()?.to_ascii_uppercase();
-    if !('A'..='J').contains(&row) {
+    let bytes = input.trim().as_bytes();
+    if bytes.len() != 2 {
         return None;
     }
-    let col: u8 = chars.collect::<String>().parse().ok().filter(|&c| c < 10)?;
-    CellIndex::from_row_col(row as u8 - b'A', col)
+    let row = bytes[0].to_ascii_uppercase();
+    if !(b'A'..=b'J').contains(&row) || !bytes[1].is_ascii_digit() {
+        return None;
+    }
+    CellIndex::from_row_col(row - b'A', bytes[1] - b'0')
+}
+
+fn decode_hex(raw: &str) -> Option<Vec<u8>> {
+    let s = raw.trim();
+    if (s.len() & 1) != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+fn parse_fleet_hex(raw: &str, rules: Rules) -> Result<[u8; 3 * K], String> {
+    let bytes = decode_hex(raw).ok_or_else(|| "invalid hex in --fleet".to_string())?;
+    let arr: [u8; 3 * K] = bytes
+        .try_into()
+        .map_err(|_| format!("--fleet must be exactly {} hex chars", 6 * K))?;
+    Fleet::from_bytes(&arr, rules).map_err(|e| format!("invalid --fleet placement: {e}"))?;
+    Ok(arr)
+}
+
+struct ParsedTranscript {
+    hello_a: Vec<u8>,
+    hello_b: Vec<u8>,
+    frames: Vec<Vec<u8>>,
+}
+
+fn parse_transcript_text(text: &str) -> Result<ParsedTranscript, String> {
+    if text.trim_start().starts_with('{') {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("invalid JSON transcript: {e}"))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "JSON transcript must be an object".to_string())?;
+        let hex_field = |keys: &[&str]| -> Result<Option<Vec<u8>>, String> {
+            for key in keys {
+                match object.get(*key) {
+                    None | Some(serde_json::Value::Null) => continue,
+                    Some(serde_json::Value::String(raw)) => {
+                        return decode_hex(raw)
+                            .map(Some)
+                            .ok_or_else(|| format!("invalid hex in JSON field '{key}'"));
+                    }
+                    Some(_) => return Err(format!("JSON field '{key}' must be a hex string")),
+                }
+            }
+            Ok(None)
+        };
+        let hello_a = hex_field(&["hello_a", "hello_one"])?
+            .ok_or_else(|| "missing hello_a / hello_one in JSON transcript".to_string())?;
+        let hello_b = hex_field(&["hello_b", "hello_two"])?
+            .ok_or_else(|| "missing hello_b / hello_two in JSON transcript".to_string())?;
+        let frame_values = object
+            .get("frames")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "JSON field 'frames' must be an array".to_string())?;
+        let mut frames = Vec::with_capacity(frame_values.len() + 1);
+        for (i, item) in frame_values.iter().enumerate() {
+            let raw = item
+                .as_str()
+                .ok_or_else(|| format!("frames[{i}] must be a hex string"))?;
+            frames.push(decode_hex(raw).ok_or_else(|| format!("invalid hex at frames[{i}]"))?);
+        }
+        if let Some(ev) = hex_field(&["evidence_frame"])? {
+            if frames.last().is_none_or(|f| f.as_slice() != ev.as_slice()) {
+                frames.push(ev);
+            }
+        }
+        return Ok(ParsedTranscript {
+            hello_a,
+            hello_b,
+            frames,
+        });
+    }
+
+    let mut hello_a = None;
+    let mut hello_b = None;
+    let mut indexed_frames: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut evidence = None;
+
+    for (line_no, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!("line {}: expected key = value", line_no + 1));
+        };
+        let key = k.trim();
+        let val = v.trim();
+        match key {
+            "hello_a" | "hello_role_a" | "hello_one" => {
+                hello_a = Some(
+                    decode_hex(val)
+                        .ok_or_else(|| format!("line {}: invalid hex for {key}", line_no + 1))?,
+                );
+            }
+            "hello_b" | "hello_role_b" | "hello_two" => {
+                hello_b = Some(
+                    decode_hex(val)
+                        .ok_or_else(|| format!("line {}: invalid hex for {key}", line_no + 1))?,
+                );
+            }
+            "evidence_frame" => {
+                evidence = Some(decode_hex(val).ok_or_else(|| {
+                    format!("line {}: invalid hex for evidence_frame", line_no + 1)
+                })?);
+            }
+            _ if key.starts_with("frame[") && key.ends_with(']') => {
+                let idx_str = &key[6..key.len() - 1];
+                let idx: usize = idx_str
+                    .parse()
+                    .map_err(|_| format!("line {}: invalid frame index '{key}'", line_no + 1))?;
+                let bytes = decode_hex(val)
+                    .ok_or_else(|| format!("line {}: invalid hex in {key}", line_no + 1))?;
+                indexed_frames.push((idx, bytes));
+            }
+            _ => {}
+        }
+    }
+
+    let hello_a = hello_a.ok_or_else(|| "missing hello_a / hello_role_a".to_string())?;
+    let hello_b = hello_b.ok_or_else(|| "missing hello_b / hello_role_b".to_string())?;
+    indexed_frames.sort_by_key(|(idx, _)| *idx);
+    let mut frames = Vec::with_capacity(indexed_frames.len() + usize::from(evidence.is_some()));
+    for (expected, (idx, bytes)) in indexed_frames.into_iter().enumerate() {
+        if idx != expected {
+            return Err(format!(
+                "non-contiguous frame indices: expected {expected}, found {idx}"
+            ));
+        }
+        frames.push(bytes);
+    }
+    if let Some(ev) = evidence {
+        if frames.last().is_none_or(|f| f.as_slice() != ev.as_slice()) {
+            frames.push(ev);
+        }
+    }
+    Ok(ParsedTranscript {
+        hello_a,
+        hello_b,
+        frames,
+    })
+}
+
+fn verify_transcript_file(path: &str) -> Result<(), String> {
+    const MAX_TRANSCRIPT_BYTES: u64 = 2 * 1024 * 1024;
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+    if meta.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(format!(
+            "{path} exceeds {MAX_TRANSCRIPT_BYTES}-byte transcript limit"
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let parsed = parse_transcript_text(&text)?;
+    let report = verify::verify_transcript(&parsed.hello_a, &parsed.hello_b, &parsed.frames)
+        .map_err(|e| format!("transcript invalid: {e}"))?;
+
+    let rules_str = match report.rules {
+        Rules::Standard => "standard",
+        Rules::NoTouch => "no-touch",
+    };
+    println!("rules: {rules_str}");
+    println!("params_id: {}", hex(&report.params_id));
+    println!("sid: {}", hex(&report.sid));
+    println!("genesis_hash: {}", hex(&report.genesis_hash));
+    println!("role_a: {}", report.role_a_key.fingerprint_hex());
+    println!("role_b: {}", report.role_b_key.fingerprint_hex());
+    if let Some(first) = report.first_mover {
+        println!("first_mover: {first:?}");
+    }
+    println!("frames_verified: {}", report.frames_verified);
+    println!(
+        "tallies: A shots={} hits={}; B shots={} hits={}",
+        report.shots_by_a, report.hits_by_a, report.shots_by_b, report.hits_by_b
+    );
+    match report.verdict {
+        TranscriptVerdict::Completed { winner } => {
+            println!("verdict: COMPLETED winner={winner:?}");
+        }
+        TranscriptVerdict::Resigned { winner, resigned } => {
+            println!("verdict: RESIGNED winner={winner:?} resigned={resigned:?}");
+        }
+        TranscriptVerdict::AttributableViolation {
+            guilty,
+            sequence,
+            frame_hash,
+            violation,
+        } => {
+            println!(
+                "verdict: ATTRIBUTABLE_VIOLATION guilty={guilty:?} seq={sequence} hash={} reason={violation}",
+                hex(&frame_hash)
+            );
+        }
+        TranscriptVerdict::Incomplete { expected_next } => {
+            println!("verdict: INCOMPLETE expected_next={expected_next:?}");
+        }
+    }
+    Ok(())
 }
 
 fn cell_name(cell: CellIndex) -> String {
@@ -702,6 +1000,8 @@ mod tests {
             name: "test".into(),
             key_file: None,
             rules: Rules::Standard,
+            fleet: None,
+            transcript_out: None,
             auto: true,
         };
         let mut demo = Demo::new(Parameters::standard(), key, &opts);
@@ -777,5 +1077,119 @@ mod tests {
             peer.join().unwrap();
         });
         assert_eq!(demo.session().winner(), Some(first));
+    }
+
+    #[test]
+    fn parse_cell_accepts_valid_and_rejects_malformed() {
+        assert_eq!(parse_cell("A0"), CellIndex::from_row_col(0, 0));
+        assert_eq!(parse_cell("j9"), CellIndex::from_row_col(9, 9));
+        assert_eq!(parse_cell(" B5 "), CellIndex::from_row_col(1, 5));
+        for bad in ["B05", "B+5", "K0", "A10", "", "5B", "A\u{0660}"] {
+            assert_eq!(parse_cell(bad), None, "expected None for '{bad}'");
+        }
+    }
+
+    #[test]
+    fn parse_action_supports_fleet_transcript_and_verify() {
+        let valid_notouch_fleet = "000000020000040000060000080000";
+        let args: Vec<String> = vec![
+            "listen",
+            "--addr",
+            "127.0.0.1:7878",
+            "--rules",
+            "no-touch",
+            "--fleet",
+            valid_notouch_fleet,
+            "--transcript-out",
+            "/tmp/out.txt",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        match parse_action(&args).unwrap() {
+            CliAction::Play(opts) => {
+                assert!(opts.listen);
+                assert_eq!(opts.rules, Rules::NoTouch);
+                assert!(opts.fleet.is_some());
+                assert_eq!(opts.transcript_out.as_deref(), Some("/tmp/out.txt"));
+            }
+            CliAction::VerifyTranscript(_) => panic!("expected Play"),
+        }
+
+        // Standard-valid touching fleet (rows 4 & 5 touch) must fail under --rules no-touch.
+        let touching_fleet: Vec<String> = vec![
+            "listen",
+            "--addr",
+            "127.0.0.1:7878",
+            "--rules",
+            "no-touch",
+            "--fleet",
+            "000000020000040000050000070000",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse_action(&touching_fleet).is_err());
+
+        // Overlapping ships must fail --fleet validation.
+        let bad_fleet: Vec<String> = vec![
+            "connect",
+            "--addr",
+            "127.0.0.1:7878",
+            "--fleet",
+            "000000000000000000000000000000",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(parse_action(&bad_fleet).is_err());
+
+        let ver: Vec<String> = vec!["verify-transcript", "vectors/game_transcript_v1.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        match parse_action(&ver).unwrap() {
+            CliAction::VerifyTranscript(p) => assert_eq!(p, "vectors/game_transcript_v1.txt"),
+            CliAction::Play(_) => panic!("expected VerifyTranscript"),
+        }
+    }
+
+    #[test]
+    fn verify_transcript_file_verifies_pinned_v1_vector() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../vectors/game_transcript_v1.txt"
+        );
+        verify_transcript_file(path).unwrap();
+
+        let text = std::fs::read_to_string(path).unwrap();
+        let p = parse_transcript_text(&text).unwrap();
+        let json = format!(
+            "{{\n  \"hello_a\": \"{}\",\n  \"hello_b\": \"{}\",\n  \"frames\": [{}]\n}}",
+            hex(&p.hello_a),
+            hex(&p.hello_b),
+            p.frames
+                .iter()
+                .map(|f| format!("\"{}\"", hex(f)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let jp = parse_transcript_text(&json).unwrap();
+        assert_eq!(jp.hello_a, p.hello_a);
+        assert_eq!(jp.hello_b, p.hello_b);
+        assert_eq!(jp.frames, p.frames);
+
+        assert!(parse_transcript_text(
+            r#"{"hello_a":"00","hello_b":"00","frames":"not-an-array"}"#
+        )
+        .is_err());
+        assert!(parse_transcript_text(
+            r#"{"note":"\"hello_a\":\"00\"","hello_b":"00","frames":[]}"#
+        )
+        .is_err());
+        assert!(
+            parse_transcript_text(r#"{"hello_a":"00","hello_b":"00","frames":[]} trailing"#)
+                .is_err()
+        );
     }
 }

@@ -1,0 +1,9 @@
+.git
+.gitignore
+zkship/target
+zkship/fuzz/target
+docs
+bench
+zkship.com
+**/pkg
+**/*.log

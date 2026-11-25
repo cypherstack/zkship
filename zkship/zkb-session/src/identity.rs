@@ -5,6 +5,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::{CryptoRng, RngCore};
 use std::fmt;
+use zeroize::Zeroizing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IdentityError {
@@ -24,6 +25,7 @@ impl fmt::Display for IdentityError {
 impl std::error::Error for IdentityError {}
 
 /// Never transmitted.
+#[cfg_attr(fuzzing, derive(Clone))]
 pub struct IdentityKeypair(SigningKey);
 
 impl IdentityKeypair {
@@ -33,6 +35,10 @@ impl IdentityKeypair {
 
     pub fn from_seed(seed: &[u8; 32]) -> IdentityKeypair {
         IdentityKeypair(SigningKey::from_bytes(seed))
+    }
+
+    pub fn to_seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes())
     }
 
     pub fn peer_key(&self) -> PeerKey {
@@ -57,11 +63,18 @@ pub struct PeerKey {
 impl PeerKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Result<PeerKey, IdentityError> {
         let key = VerifyingKey::from_bytes(&bytes).map_err(|_| IdentityError::InvalidKey)?;
+        if key.is_weak() {
+            return Err(IdentityError::InvalidKey);
+        }
         Ok(PeerKey { bytes, key })
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.bytes
+    }
+
+    pub fn fingerprint_hex(&self) -> String {
+        self.bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Strict: rejects non-canonical and small-order encodings.
@@ -191,5 +204,21 @@ mod tests {
         assert!(policy.authenticate(&key).is_some());
         let stranger = IdentityKeypair::from_seed(&[4; 32]).peer_key();
         assert!(policy.authenticate(&stranger).is_none());
+    }
+
+    #[test]
+    fn weak_keys_are_rejected() {
+        // Known small-order / identity compressed Edwards Y points.
+        let mut neg_identity = [0xffu8; 32];
+        neg_identity[0] = 0xec;
+        neg_identity[31] = 0x7f;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        for weak in [[0u8; 32], identity, neg_identity] {
+            assert_eq!(PeerKey::from_bytes(weak), Err(IdentityError::InvalidKey));
+        }
+        let kp = IdentityKeypair::from_seed(&[0x42; 32]);
+        assert_eq!(*kp.to_seed(), [0x42; 32]);
+        assert_eq!(kp.peer_key().fingerprint_hex().len(), 64);
     }
 }

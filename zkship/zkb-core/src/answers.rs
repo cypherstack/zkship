@@ -23,7 +23,7 @@
 //! (this one included) and the cell.
 
 use crate::bp::range::{self, RangeProof};
-use crate::bp::{read_scalar, PedersenBases};
+use crate::bp::{read_scalar, BpError, PedersenBases};
 use crate::fleet::{Fleet, SHIP_BITS};
 use crate::params::{CellIndex, Parameters, FLEET_LENGTHS, K, N};
 use curve25519_dalek::ristretto::RistrettoPoint;
@@ -33,7 +33,7 @@ use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use std::fmt;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const TRANSCRIPT_LABEL: &[u8] = b"zkbattleship/paper/v1/not-sunk";
 
@@ -77,6 +77,7 @@ pub enum AnswerDecodeError {
     InvalidTag(u8),
     WrongLength { expected: usize, actual: usize },
     NoShipLeft,
+    InvalidUnsunkCount(usize),
     InvalidShip(u8),
     InvalidCell { offset: usize },
     CellsNotIncreasing,
@@ -92,6 +93,9 @@ impl fmt::Display for AnswerDecodeError {
                 write!(f, "answer is {actual} bytes, expected {expected}")
             }
             AnswerDecodeError::NoShipLeft => write!(f, "hit answered after every ship sank"),
+            AnswerDecodeError::InvalidUnsunkCount(n) => {
+                write!(f, "unsunk ship count {n} exceeds fleet size {K}")
+            }
             AnswerDecodeError::InvalidShip(s) => write!(f, "sunk ship index {s} out of range"),
             AnswerDecodeError::InvalidCell { offset } => {
                 write!(f, "cell index at byte offset {offset} is off the board")
@@ -181,6 +185,9 @@ impl ShotAnswer {
                 if unsunk == 0 {
                     return Err(AnswerDecodeError::NoShipLeft);
                 }
+                if unsunk > K {
+                    return Err(AnswerDecodeError::InvalidUnsunkCount(unsunk));
+                }
                 expect(hit_len(unsunk))?;
                 let not_sunk = RangeProof::decode(&bytes[33..], NOT_SUNK_BITS, unsunk).map_err(
                     |e| match e {
@@ -243,6 +250,7 @@ pub struct BoardShots {
     shots: u8,
     hit_commitments: [RistrettoPoint; K],
     sunk: [bool; K],
+    sunk_cells: [Option<Vec<CellIndex>>; K],
 }
 
 impl Default for BoardShots {
@@ -252,6 +260,7 @@ impl Default for BoardShots {
             shots: 0,
             hit_commitments: [RistrettoPoint::identity(); K],
             sunk: [false; K],
+            sunk_cells: std::array::from_fn(|_| None),
         }
     }
 }
@@ -268,6 +277,10 @@ impl BoardShots {
 
     pub fn sunk(&self) -> &[bool; K] {
         &self.sunk
+    }
+
+    pub fn sunk_cells(&self, ship: usize) -> Option<&[CellIndex]> {
+        self.sunk_cells.get(ship).and_then(|c| c.as_deref())
     }
 
     pub fn unsunk(&self) -> impl Iterator<Item = usize> + '_ {
@@ -300,11 +313,12 @@ impl BoardShots {
     }
 }
 
-/// The defender's secrets for play: the fleet bits, the blinders, and the
-/// running hit counts and hit-blinder sums per ship. Zeroized on drop.
+/// The defender's secrets for play: the fleet description, bits, blinders,
+/// and running hit counts and hit-blinder sums per ship. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(fuzzing, derive(Clone))]
 pub struct ResponderSecrets {
+    fleet_bytes: [u8; 3 * K],
     bits: Vec<u8>,
     rho: Vec<Scalar>,
     hits: [u8; K],
@@ -315,11 +329,20 @@ impl ResponderSecrets {
     pub fn new(fleet: &Fleet, rho: Vec<Scalar>) -> ResponderSecrets {
         assert_eq!(rho.len(), SHIP_BITS, "one blinder per ship cell");
         ResponderSecrets {
+            fleet_bytes: *fleet.to_bytes(),
             bits: fleet.ship_bits().to_vec(),
             rho,
             hits: [0; K],
             hit_blinders: [Scalar::ZERO; K],
         }
+    }
+
+    pub(crate) fn fleet_bytes(&self) -> [u8; 3 * K] {
+        self.fleet_bytes
+    }
+
+    pub(crate) fn rho(&self) -> &[Scalar] {
+        &self.rho
     }
 
     /// Rekeys a nonce RNG with the defender's witness (the prover's hedge).
@@ -369,19 +392,16 @@ fn not_sunk_transcript(
     transcript
 }
 
-/// Honest answer to the shot at `cell`, which both `board` and `secrets`
-/// have already registered. The answer reveals hit or miss and, on a sink,
-/// the ship, but on a plain hit not which ship was hit. So the hit ship is
-/// found by a constant-time scan that visits every ship and indexes none by
-/// a secret, and the control flow branches only on the public outcome.
-pub fn answer_shot<R: RngCore + CryptoRng>(
+/// Fallible version of [`answer_shot`], returning an error if `range::prove`
+/// fails (zero challenge or no unsunk ships).
+pub fn try_answer_shot<R: RngCore + CryptoRng>(
     params: &Parameters,
     ctx: &AnswerContext,
     board: &BoardShots,
     secrets: &ResponderSecrets,
     cell: CellIndex,
     rng: &mut R,
-) -> ShotAnswer {
+) -> Result<ShotAnswer, BpError> {
     debug_assert!(board.is_shot(cell));
     let i = cell.index() as usize;
     let rho: Scalar = (0..K).map(|j| secrets.rho[j * N + i]).sum();
@@ -399,7 +419,7 @@ pub fn answer_shot<R: RngCore + CryptoRng>(
     }
     // Both branches are on what the answer's tag reveals anyway.
     if !bool::from(hit) {
-        return ShotAnswer::Miss { rho };
+        return Ok(ShotAnswer::Miss { rho });
     }
     if bool::from(sinks) {
         let ship = usize::from(ship);
@@ -412,18 +432,25 @@ pub fn answer_shot<R: RngCore + CryptoRng>(
                 )
             })
             .collect();
-        return ShotAnswer::Sunk {
+        return Ok(ShotAnswer::Sunk {
             rho,
             ship: ship as u8,
             openings,
-        };
+        });
     }
     let unsunk: Vec<usize> = board.unsunk().collect();
-    let values: Vec<u64> = unsunk
-        .iter()
-        .map(|&j| u64::from(secrets.hits[j]) + NOT_SUNK_OFFSET - u64::from(FLEET_LENGTHS[j]))
-        .collect();
-    let blindings: Vec<Scalar> = unsunk.iter().map(|&j| secrets.hit_blinders[j]).collect();
+    let values = Zeroizing::new(
+        unsunk
+            .iter()
+            .map(|&j| u64::from(secrets.hits[j]) + NOT_SUNK_OFFSET - u64::from(FLEET_LENGTHS[j]))
+            .collect::<Vec<_>>(),
+    );
+    let blindings = Zeroizing::new(
+        unsunk
+            .iter()
+            .map(|&j| secrets.hit_blinders[j])
+            .collect::<Vec<_>>(),
+    );
     let commitments = board.not_sunk_commitments(params);
     let mut transcript = not_sunk_transcript(params, ctx, board.shots(), cell);
     let not_sunk = range::prove(
@@ -438,12 +465,26 @@ pub fn answer_shot<R: RngCore + CryptoRng>(
         &blindings,
         NOT_SUNK_BITS,
         rng,
-    )
-    .expect("honest values are below 8; fails only on a zero challenge (paper Lemma 5.5)");
-    ShotAnswer::Hit {
+    )?;
+    Ok(ShotAnswer::Hit {
         rho,
         not_sunk: Box::new(not_sunk),
-    }
+    })
+}
+
+/// Honest answer to the shot at `cell`, which both `board` and `secrets`
+/// have already registered. Visits every ship in constant time and branches
+/// only on the public outcome.
+pub fn answer_shot<R: RngCore + CryptoRng>(
+    params: &Parameters,
+    ctx: &AnswerContext,
+    board: &BoardShots,
+    secrets: &ResponderSecrets,
+    cell: CellIndex,
+    rng: &mut R,
+) -> ShotAnswer {
+    try_answer_shot(params, ctx, board, secrets, cell, rng)
+        .expect("honest values are below 8; fails only on a zero challenge (paper Lemma 5.5)")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,6 +496,8 @@ pub enum AnswerOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnswerRejection {
+    /// Setup ship-cell commitment slice does not have length `SHIP_BITS`.
+    InvalidShipCommitments,
     /// `B_i` does not open to the claimed hit or miss.
     CellOpeningFailed,
     NotSunkProofFailed,
@@ -475,6 +518,9 @@ pub enum AnswerRejection {
 impl fmt::Display for AnswerRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            AnswerRejection::InvalidShipCommitments => {
+                write!(f, "setup ship-cell commitment slice has the wrong length")
+            }
             AnswerRejection::CellOpeningFailed => {
                 write!(f, "hit/miss opening does not match the cell commitment")
             }
@@ -511,6 +557,9 @@ pub fn verify_answer(
     cell: CellIndex,
     answer: &ShotAnswer,
 ) -> Result<AnswerOutcome, AnswerRejection> {
+    if ship_cells.len() != SHIP_BITS {
+        return Err(AnswerRejection::InvalidShipCommitments);
+    }
     let g = params.g();
     let h = params.h();
     let b_i = &cell_commitments[cell.index() as usize];
@@ -580,7 +629,18 @@ pub fn verify_answer(
 impl BoardShots {
     /// Records an accepted sink announcement.
     pub fn mark_sunk(&mut self, ship: u8) {
-        self.sunk[ship as usize] = true;
+        if let Some(slot) = self.sunk.get_mut(ship as usize) {
+            *slot = true;
+        }
+    }
+
+    /// Records an accepted sink announcement together with its verified cells.
+    pub fn mark_sunk_with_cells(&mut self, ship: u8, cells: Vec<CellIndex>) {
+        let j = ship as usize;
+        if j < K {
+            self.sunk[j] = true;
+            self.sunk_cells[j] = Some(cells);
+        }
     }
 }
 
@@ -1043,5 +1103,35 @@ mod tests {
         );
         assert!(!ShotAnswer::is_possible_length(1, 34));
         assert!(ShotAnswer::is_possible_length(2, sunk_len(3)));
+        assert_eq!(
+            ShotAnswer::decode(&hit.encode(), usize::MAX),
+            Err(AnswerDecodeError::InvalidUnsunkCount(usize::MAX))
+        );
+    }
+
+    #[test]
+    fn guards_reject_bad_ship_cells_and_out_of_range_mark_sunk() {
+        let mut board = Board::new(&fleet_a());
+        let (hit, _) = board.shoot(0);
+        let cell = CellIndex::from_index(0).unwrap();
+        assert_eq!(
+            verify_answer(
+                board.params,
+                &ctx(),
+                &board.verified.ship_cells()[..SHIP_BITS - 1],
+                board.verified.cell_commitments(),
+                &board.public,
+                cell,
+                &hit,
+            ),
+            Err(AnswerRejection::InvalidShipCommitments)
+        );
+        board.public.mark_sunk(u8::MAX);
+        board.public.mark_sunk_with_cells(4, fleet_a().cells(4));
+        assert!(board.public.sunk()[4]);
+        assert_eq!(
+            board.public.sunk_cells(4),
+            Some(fleet_a().cells(4).as_slice())
+        );
     }
 }

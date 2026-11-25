@@ -1,0 +1,31 @@
+[package]
+name = "zkb-relay"
+description = "Zero-Knowledge Battleship: untrusted WebSocket/HTTP relay and transcript verifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zkb-core.workspace = true
+zkb-session.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors", "limit", "set-header"] }
+subtle.workspace = true
+rand_core.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+zkb-wasm = { path = "../zkb-wasm" }
+tokio-tungstenite = "0.26"
+rand = "0.8"
+rand_chacha = "0.3"
+curve25519-dalek.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

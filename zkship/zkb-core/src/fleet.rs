@@ -88,6 +88,19 @@ pub fn neighbours(cell: CellIndex) -> impl Iterator<Item = CellIndex> {
         })
 }
 
+fn sample_below<R: RngCore + CryptoRng>(rng: &mut R, bound: u8) -> u8 {
+    debug_assert!(bound > 0);
+    let limit = 256u16 - (256u16 % u16::from(bound));
+    let mut buf = [0u8; 1];
+    loop {
+        rng.fill_bytes(&mut buf);
+        let v = u16::from(buf[0]);
+        if v < limit {
+            return (v % u16::from(bound)) as u8;
+        }
+    }
+}
+
 impl Fleet {
     pub fn new(ships: [ShipPlacement; K], rules: Rules) -> Result<Fleet, PlacementError> {
         let fleet = Fleet { ships };
@@ -117,16 +130,20 @@ impl Fleet {
         Ok(fleet)
     }
 
-    /// Uniform position and direction per ship, rejection-sampled until legal.
+    /// Rejection-sampled uniformly over valid per-ship placements until legal.
     pub fn random<R: RngCore + CryptoRng>(rng: &mut R, rules: Rules) -> Fleet {
         loop {
-            let ships = std::array::from_fn(|_| {
-                let word = rng.next_u32();
-                ShipPlacement {
-                    row: ((word & 0xffff) % BOARD_N as u32) as u8,
-                    col: ((word >> 16) % BOARD_N as u32) as u8,
-                    vertical: rng.next_u32() & 1 == 1,
-                }
+            let ships = std::array::from_fn(|j| {
+                let vertical = sample_below(rng, 2) == 1;
+                let max_start = BOARD_N as u8 - FLEET_LENGTHS[j] + 1;
+                let along = sample_below(rng, max_start);
+                let across = sample_below(rng, BOARD_N as u8);
+                let (row, col) = if vertical {
+                    (along, across)
+                } else {
+                    (across, along)
+                };
+                ShipPlacement { row, col, vertical }
             });
             if let Ok(fleet) = Fleet::new(ships, rules) {
                 return fleet;
@@ -310,11 +327,16 @@ pub(crate) mod tests {
     fn random_fleets_are_legal_and_roundtrip() {
         let mut rng = ChaCha20Rng::from_seed([3; 32]);
         for rules in [Rules::Standard, Rules::NoTouch] {
+            let mut saw_vertical = false;
+            let mut saw_horizontal = false;
             for _ in 0..50 {
                 let fleet = Fleet::random(&mut rng, rules);
+                saw_vertical |= fleet.ships().iter().any(|s| s.vertical);
+                saw_horizontal |= fleet.ships().iter().any(|s| !s.vertical);
                 let again = Fleet::from_bytes(&fleet.to_bytes(), rules).unwrap();
                 assert_eq!(again, fleet);
             }
+            assert!(saw_vertical && saw_horizontal);
         }
     }
 }

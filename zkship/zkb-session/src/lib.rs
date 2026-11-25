@@ -9,3 +9,4 @@ pub mod frame;
 pub mod hello;
 pub mod identity;
 pub mod state;
+pub mod verify;

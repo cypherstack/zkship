@@ -19,7 +19,7 @@ use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
 use rand_core::{CryptoRng, RngCore};
 use std::fmt;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Fixed by the session bootstrap: lower identity key is A and commits first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +150,14 @@ impl RngCore for SeededRng {
 
 impl CryptoRng for SeededRng {}
 
+/// Secret material required to snapshot and restore an in-progress [`Game`].
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct GameSecrets {
+    pub fleet_bytes: [u8; 3 * K],
+    pub rho: Vec<Scalar>,
+    pub answer_seed: [u8; 32],
+}
+
 #[cfg_attr(fuzzing, derive(Clone))]
 pub struct Game<'a> {
     params: &'a Parameters,
@@ -159,7 +167,8 @@ pub struct Game<'a> {
     own_ship_cells: Vec<RistrettoPoint>,
     own_board: BoardShots,
     own_secrets: Option<Box<ResponderSecrets>>,
-    answer_rng: SeededRng,
+    answer_rng: Option<SeededRng>,
+    answer_seed: Option<Zeroizing<[u8; 32]>>,
     peer: VerifiedSetup,
     peer_board: BoardShots,
     verified_hits: u8,
@@ -181,7 +190,7 @@ impl<'a> Game<'a> {
         answer_seed: &[u8; 32],
         peer: VerifiedSetup,
     ) -> Result<Game<'a>, GameError> {
-        let rho = Zeroizing::new(rho);
+        let mut rho = Zeroizing::new(rho);
         if rho.len() != SHIP_BITS {
             return Err(GameError::WrongWitnessLength {
                 expected: SHIP_BITS,
@@ -204,13 +213,25 @@ impl<'a> Game<'a> {
             ctx,
             own_ship_cells,
             own_board: BoardShots::default(),
-            own_secrets: Some(Box::new(ResponderSecrets::new(fleet, rho.to_vec()))),
-            answer_rng: SeededRng::new(answer_seed),
+            own_secrets: Some(Box::new(ResponderSecrets::new(
+                fleet,
+                std::mem::take(&mut *rho),
+            ))),
+            answer_rng: Some(SeededRng::new(answer_seed)),
+            answer_seed: Some(Zeroizing::new(*answer_seed)),
             peer,
             peer_board: BoardShots::default(),
             verified_hits: 0,
             hits_conceded: 0,
         })
+    }
+
+    pub fn params(&self) -> &'a Parameters {
+        self.params
+    }
+
+    pub fn context(&self) -> &GameContext {
+        &self.ctx
     }
 
     pub fn state(&self) -> State {
@@ -236,6 +257,21 @@ impl<'a> Game<'a> {
         *self.peer_board.sunk()
     }
 
+    /// Ships announced sunk on the own board, fleet order.
+    pub fn own_sunk(&self) -> [bool; K] {
+        *self.own_board.sunk()
+    }
+
+    /// Verified cells of peer ship `j`, once announced sunk.
+    pub fn peer_sunk_cells(&self, ship: usize) -> Option<&[CellIndex]> {
+        self.peer_board.sunk_cells(ship)
+    }
+
+    /// Announced cells of own ship `j`, once sunk.
+    pub fn own_sunk_cells(&self, ship: usize) -> Option<&[CellIndex]> {
+        self.own_board.sunk_cells(ship)
+    }
+
     pub fn shots_on_board(&self, role: Role) -> &BoardShots {
         if role == self.local_role {
             &self.own_board
@@ -246,6 +282,21 @@ impl<'a> Game<'a> {
 
     pub fn has_secrets(&self) -> bool {
         self.own_secrets.is_some()
+    }
+
+    pub fn has_answer_rng(&self) -> bool {
+        self.answer_rng.is_some()
+    }
+
+    pub fn snapshot_secrets(&self) -> Option<GameSecrets> {
+        let (Some(secrets), Some(seed)) = (&self.own_secrets, &self.answer_seed) else {
+            return None;
+        };
+        Some(GameSecrets {
+            fleet_bytes: secrets.fleet_bytes(),
+            rho: secrets.rho().to_vec(),
+            answer_seed: **seed,
+        })
     }
 
     pub fn fire_shot(&mut self, cell: CellIndex) -> Result<u8, GameError> {
@@ -308,6 +359,12 @@ impl<'a> Game<'a> {
             .ok_or(GameError::InternalInvariantFailure(
                 "answer owed but the own-board secrets are gone",
             ))?;
+        let answer_rng = self
+            .answer_rng
+            .as_mut()
+            .ok_or(GameError::InternalInvariantFailure(
+                "answer owed but the answer RNG is gone",
+            ))?;
         let ctx = AnswerContext {
             defender_id: &self.ctx.own_id,
             sid: &self.ctx.sid,
@@ -315,13 +372,15 @@ impl<'a> Game<'a> {
         // Hedge the seeded nonce source with the secrets, as the setup prover does.
         let mut hedge = Transcript::new(b"zkbattleship/paper/v1/answer-hedge");
         hedge.append_message(b"shots", &[self.own_board.shots()]);
-        let mut rng = secrets
-            .rekey(hedge.build_rng())
-            .finalize(&mut self.answer_rng);
+        let mut rng = secrets.rekey(hedge.build_rng()).finalize(answer_rng);
         let answer =
-            answers::answer_shot(self.params, &ctx, &self.own_board, secrets, cell, &mut rng);
-        if let ShotAnswer::Sunk { ship, .. } = &answer {
-            self.own_board.mark_sunk(*ship);
+            answers::try_answer_shot(self.params, &ctx, &self.own_board, secrets, cell, &mut rng)
+                .map_err(|_| {
+                GameError::InternalInvariantFailure("not-sunk range proof generation failed")
+            })?;
+        if let ShotAnswer::Sunk { ship, openings, .. } = &answer {
+            self.own_board
+                .mark_sunk_with_cells(*ship, openings.iter().map(|(c, _)| *c).collect());
         }
         // Whether it hit is public (it is being sent).
         if answer.is_hit() {
@@ -335,6 +394,40 @@ impl<'a> Game<'a> {
             };
         }
         Ok(answer)
+    }
+
+    /// Replays a previously sent own `Answer` (used when restoring a session
+    /// snapshot) so board tallies and `answer_rng` advance identically without
+    /// re-running proof generation.
+    pub fn replay_own_answer(&mut self, answer: &ShotAnswer) -> Result<(), GameError> {
+        let State::AwaitingAnswer { shooter, .. } = self.state else {
+            return Err(GameError::WrongState);
+        };
+        if shooter == self.local_role {
+            return Err(GameError::WrongState);
+        }
+        let mut scratch = Zeroizing::new([0u8; 32]);
+        self.answer_rng
+            .as_mut()
+            .ok_or(GameError::InternalInvariantFailure(
+                "answer replay owed but the answer RNG is gone",
+            ))?
+            .fill_bytes(&mut *scratch);
+        if let ShotAnswer::Sunk { ship, openings, .. } = answer {
+            self.own_board
+                .mark_sunk_with_cells(*ship, openings.iter().map(|(c, _)| *c).collect());
+        }
+        if answer.is_hit() {
+            self.hits_conceded += 1;
+        }
+        if self.hits_conceded == T as u8 {
+            self.finish(self.local_role.other());
+        } else {
+            self.state = State::AwaitingShot {
+                shooter: self.local_role,
+            };
+        }
+        Ok(())
     }
 
     /// Parses an answer to the local player's pending shot; the hit proof's
@@ -355,6 +448,8 @@ impl<'a> Game<'a> {
     fn finish(&mut self, winner: Role) {
         self.state = State::Finished { winner };
         self.own_secrets = None;
+        self.answer_rng = None;
+        self.answer_seed = None;
     }
 
     /// At T verified hits every ship must have been announced sunk, else
@@ -384,8 +479,8 @@ impl<'a> Game<'a> {
         let result = match outcome {
             AnswerOutcome::Miss => ShotOutcome::Miss,
             AnswerOutcome::Hit => ShotOutcome::Hit,
-            AnswerOutcome::Sunk { ship, .. } => {
-                self.peer_board.mark_sunk(ship);
+            AnswerOutcome::Sunk { ship, cells } => {
+                self.peer_board.mark_sunk_with_cells(ship, cells);
                 ShotOutcome::Sunk { ship }
             }
         };
@@ -400,6 +495,11 @@ impl<'a> Game<'a> {
             }
             self.finish(self.local_role);
             return Ok(ShotOutcome::Win);
+        }
+        if self.peer_board.unsunk_count() == 0 {
+            return Err(GameError::InternalInvariantFailure(
+                "all ships announced sunk before T verified hits",
+            ));
         }
         self.state = State::AwaitingShot {
             shooter: self.local_role.other(),
@@ -526,8 +626,14 @@ mod tests {
             assert_eq!(game_a.state(), State::Finished { winner: Role::A });
             assert_eq!(game_a.verified_hits(), T as u8);
             assert_eq!(game_a.peer_sunk(), [true; K]);
+            for j in 0..K {
+                assert_eq!(game_a.peer_sunk_cells(j).unwrap(), fb.cells(j).as_slice());
+                assert_eq!(game_b.own_sunk_cells(j).unwrap(), fb.cells(j).as_slice());
+            }
             assert!(game_b.verified_hits() < T as u8);
             assert!(!game_a.has_secrets() && !game_b.has_secrets());
+            assert!(!game_a.has_answer_rng() && !game_b.has_answer_rng());
+            assert!(game_a.snapshot_secrets().is_none() && game_b.snapshot_secrets().is_none());
             assert_eq!(game_b.state(), State::Finished { winner: Role::A });
             assert_eq!(game_b.hits_conceded(), T as u8);
             assert_eq!(game_a.hits_conceded(), game_b.verified_hits());
@@ -598,9 +704,11 @@ mod tests {
         let (fa, fb) = (fleet_a(), fleet_b());
         let (mut game, _) = pair(Parameters::standard(), [&fa, &fb], Role::A);
         assert!(game.has_secrets());
+        assert!(game.has_answer_rng());
         game.finish_by_forfeit(Role::B).unwrap();
         assert_eq!(game.state(), State::Finished { winner: Role::B });
         assert!(!game.has_secrets());
+        assert!(!game.has_answer_rng());
         assert_eq!(game.finish_by_forfeit(Role::A), Err(GameError::WrongState));
         assert_eq!(game.receive_shot(0), Err(GameError::WrongState));
         assert_eq!(game.answer_shot(), Err(GameError::WrongState));
@@ -672,7 +780,8 @@ mod tests {
                 own_ship_cells: self.own_ship_cells.clone(),
                 own_board: self.own_board.clone(),
                 own_secrets: None,
-                answer_rng: SeededRng(self.answer_rng.0.clone()),
+                answer_rng: self.answer_rng.as_ref().map(|r| SeededRng(r.0.clone())),
+                answer_seed: None,
                 peer: self.peer.clone(),
                 peer_board: self.peer_board.clone(),
                 verified_hits: self.verified_hits,

@@ -19,7 +19,7 @@ use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::VartimeMultiscalarMul;
 use merlin::Transcript;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InnerProductProof {
@@ -39,7 +39,7 @@ pub fn prove(
     mut h_vec: Vec<RistrettoPoint>,
     a_vec: Vec<Scalar>,
     b_vec: Vec<Scalar>,
-) -> InnerProductProof {
+) -> Result<InnerProductProof, BpError> {
     let mut n = g_vec.len();
     assert!(n.is_power_of_two());
     assert_eq!(h_vec.len(), n);
@@ -101,6 +101,9 @@ pub fn prove(
         r_vec.push(r);
 
         let u = challenge_scalar(transcript, b"u");
+        if u == Scalar::ZERO {
+            return Err(BpError::VerificationFailed);
+        }
         let u_inv = u.invert();
 
         for i in 0..n {
@@ -115,9 +118,9 @@ pub fn prove(
                 [h_l[i], h_r[i]],
             );
         }
-        // Keep only the folded halves; the right halves still hold secrets.
+        // Zeroize folded right halves before truncation.
         for x in a_r.iter_mut().chain(b_r.iter_mut()) {
-            *x = Scalar::ZERO;
+            x.zeroize();
         }
         a_vec.truncate(n);
         b_vec.truncate(n);
@@ -126,12 +129,12 @@ pub fn prove(
         first = false;
     }
 
-    InnerProductProof {
+    Ok(InnerProductProof {
         l_vec,
         r_vec,
         a: a_vec[0],
         b: b_vec[0],
-    }
+    })
 }
 
 /// Folded-scalar view of the verifier: `(u_k^2, u_k^-2, s)` where `s_i` is the
@@ -262,7 +265,7 @@ mod tests {
             h.clone(),
             a,
             b,
-        );
+        )?;
         assert_eq!(proof.rounds(), n.trailing_zeros() as usize);
         proof.verify(
             &mut Transcript::new(b"ipa-test"),

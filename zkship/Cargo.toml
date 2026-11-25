@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "zkb-core",
     "zkb-session",
+    "zkb-wasm",
+    "zkb-relay",
     "zkb-cli",
     "zkb-bench",
 ]

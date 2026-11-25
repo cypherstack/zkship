@@ -26,14 +26,15 @@ pub struct BpGens {
 impl BpGens {
     pub fn derive(domain: &[u8], capacity: usize) -> BpGens {
         assert!(
-            capacity.is_power_of_two(),
-            "capacity must be a power of two"
+            capacity > 0 && capacity.is_power_of_two(),
+            "capacity must be a non-zero power of two"
         );
         let point = |label: &[u8], k: usize| {
+            let idx = u32::try_from(k).expect("generator index fits u32");
             let mut input = Vec::with_capacity(domain.len() + label.len() + 4);
             input.extend_from_slice(domain);
             input.extend_from_slice(label);
-            input.extend_from_slice(&(k as u32).to_le_bytes());
+            input.extend_from_slice(&idx.to_le_bytes());
             RistrettoPoint::hash_from_bytes::<Sha512>(&input)
         };
         BpGens {

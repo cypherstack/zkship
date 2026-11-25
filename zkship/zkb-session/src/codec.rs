@@ -8,6 +8,11 @@ use zkb_core::answers::ShotAnswer;
 /// 78 + 20,544 + 64 = 20,686.
 pub const MAX_FRAME_SIZE: usize = 32 * 1024;
 
+/// Five setup/coin frames plus at most `2*N - 1` shots and one answer per shot.
+/// In the worst legal game, both players miss every non-ship cell before the
+/// first mover lands the final hit on shot 199.
+pub const MAX_TRANSCRIPT_FRAMES: usize = 5 + 2 * (2 * zkb_core::params::N - 1);
+
 /// `sid[32] || sender_role u8 || sequence u64 LE || message_type u8 || prev_hash[32] || payload_len u32 LE`.
 pub const HEADER_LEN: usize = 32 + 1 + 8 + 1 + 32 + 4;
 
@@ -182,6 +187,7 @@ mod tests {
             setup::encoded_len(Rules::NoTouch)
         );
         assert_eq!(HEADER_LEN, 78);
+        assert_eq!(MAX_TRANSCRIPT_FRAMES, 403);
     }
 
     #[test]
