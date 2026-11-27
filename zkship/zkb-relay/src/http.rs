@@ -2,8 +2,9 @@ use crate::rate::{extract_client_ip, IpTracker};
 use crate::room::{decode_hex, hex, parse_rules, role_str, rules_name, RoomManager, RoomOpError};
 use crate::AppState;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -44,7 +45,7 @@ fn map_room_err(err: RoomOpError) -> axum::response::Response {
         RoomOpError::ServerFull => api_err(
             StatusCode::SERVICE_UNAVAILABLE,
             "server_full",
-            "relay room capacity reached",
+            "relay room or transcript storage capacity reached",
         ),
         RoomOpError::ServerBusy => api_err(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -61,7 +62,7 @@ fn map_room_err(err: RoomOpError) -> axum::response::Response {
         RoomOpError::TranscriptFull => api_err(
             StatusCode::BAD_REQUEST,
             "transcript_full",
-            "transcript frame limit reached",
+            "transcript frame or byte limit reached",
         ),
     }
 }
@@ -72,6 +73,8 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "rooms": stats.rooms,
         "quick_match_queued": stats.quick_match_queued,
+        "transcript_bytes": stats.transcript_bytes,
+        "max_transcript_bytes": stats.max_transcript_bytes,
     }))
 }
 
@@ -181,6 +184,24 @@ pub struct VerifyTranscriptReq {
     pub frames: Vec<String>,
 }
 
+pub async fn verify_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let ip = extract_client_ip(&headers, peer, state.config.trust_proxy);
+    if !state.tracker.allow_verify(ip, state.config.verify_per_min) {
+        return api_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "verify rate limit exceeded",
+        );
+    }
+    next.run(request).await
+}
+
 #[derive(Serialize)]
 struct SunkResp {
     ship: u8,
@@ -216,18 +237,18 @@ struct VerifyTranscriptResp {
 
 pub async fn verify_transcript(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(req): Json<VerifyTranscriptReq>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let ip = extract_client_ip(&headers, peer, state.config.trust_proxy);
-    if !state.tracker.allow_verify(ip, state.config.verify_per_min) {
-        return api_err(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "verify rate limit exceeded",
-        );
-    }
+    let req: VerifyTranscriptReq = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                format!("invalid JSON body: {e}"),
+            )
+        }
+    };
     if req.frames.len() > crate::room::MAX_TRANSCRIPT_FRAMES {
         return api_err(
             StatusCode::BAD_REQUEST,

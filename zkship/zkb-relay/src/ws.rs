@@ -425,7 +425,10 @@ fn send_room_err(tx: &mpsc::Sender<RelayOutbound>, err: RoomOpError) {
     let (code, msg) = match err {
         RoomOpError::NotFound => ("not_found", "room not found".to_string()),
         RoomOpError::RoomFull => ("room_full", "room is full or finished".to_string()),
-        RoomOpError::ServerFull => ("server_full", "relay room capacity reached".to_string()),
+        RoomOpError::ServerFull => (
+            "server_full",
+            "relay room or transcript storage capacity reached".to_string(),
+        ),
         RoomOpError::ServerBusy => (
             "server_busy",
             "transcript verifier is at capacity; retry later".to_string(),
@@ -435,7 +438,7 @@ fn send_room_err(tx: &mpsc::Sender<RelayOutbound>, err: RoomOpError) {
         RoomOpError::ClassB(m) => ("class_b", m),
         RoomOpError::TranscriptFull => (
             "transcript_full",
-            "transcript frame limit reached".to_string(),
+            "transcript frame or byte limit reached".to_string(),
         ),
     };
     send_err(tx, code, msg);

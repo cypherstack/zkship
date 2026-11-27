@@ -8,6 +8,7 @@ pub struct RelayConfig {
     pub allowed_origins: Vec<String>,
     pub trust_proxy: bool,
     pub max_rooms: usize,
+    pub max_transcript_bytes: usize,
     pub max_conns_per_ip: usize,
     pub room_create_per_min: u32,
     pub verify_per_min: u32,
@@ -27,6 +28,7 @@ impl Default for RelayConfig {
             allowed_origins: vec!["*".to_string()],
             trust_proxy: false,
             max_rooms: 4096,
+            max_transcript_bytes: 128 * 1024 * 1024,
             max_conns_per_ip: 32,
             room_create_per_min: 60,
             verify_per_min: 30,
@@ -66,6 +68,12 @@ impl RelayConfig {
         }
         if let Some(v) = parse_usize_env("ZKB_MAX_ROOMS")? {
             cfg.max_rooms = v;
+        }
+        if let Some(v) = parse_usize_env("ZKB_MAX_TRANSCRIPT_BYTES")? {
+            if v == 0 {
+                return Err("ZKB_MAX_TRANSCRIPT_BYTES must be at least 1".to_string());
+            }
+            cfg.max_transcript_bytes = v;
         }
         if let Some(v) = parse_usize_env("ZKB_MAX_CONNS_PER_IP")? {
             cfg.max_conns_per_ip = v;

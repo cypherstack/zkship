@@ -12,7 +12,7 @@ Not independently audited. Do not use for meaningful stakes.
 - `zkb-session/`: codec, Ed25519 identity and peer-auth policy hook, Hello/roles/sid, signed frame chain, coin flip, session driver, snapshot persistence, and zero-secret third-party `verify` transcript auditor.
 - `zkb-wasm/`: stateful client engine (`ClientEngine`) and `wasm-bindgen` bindings (`ZkShipClient`) for Web Workers, browsers, and Node.js.
 - `zkb-relay/`: untrusted HTTP + WebSocket room relay, reconnect catch-up, origin/rate/room limits, and `POST /api/v1/verify-transcript` endpoint.
-- `zkb-cli/`: two-process TCP demo (`listen`, `connect`, `--fleet`, `--transcript-out`) and offline transcript auditor (`verify-transcript`).
+- `zkb-cli/`: two-process TCP demo (`listen`, `connect`, `--fleet-file`, `--transcript-out`) and offline transcript auditor (`verify-transcript`). `--fleet` remains a test-only compatibility flag and leaks the placement through argv/shell history.
 - `zkb-bench/`: Criterion benchmark suite.
 - `fuzz/`: `cargo-fuzz` targets (nightly, outside the workspace).
 - `vectors/`: pinned standard & no-touch setup vectors and full-game transcript vector.
@@ -26,8 +26,8 @@ wasm-pack build zkb-wasm --target web --release
 cargo run -p zkb-core --example generate_setup_vector
 cargo run -p zkb-core --example generate_notouch_setup_vector
 cargo run -p zkb-session --example generate_game_transcript
-zkb-cli listen  --addr 127.0.0.1:7878 --name alice [--rules standard|no-touch] [--transcript-out tr.txt]
-zkb-cli connect --addr 127.0.0.1:7878 --name bob   [--rules standard|no-touch] [--transcript-out tr.txt]
+zkb-cli listen  --addr 127.0.0.1:7878 --name alice [--rules standard|no-touch] [--fleet-file private-fleet] [--transcript-out tr.txt]
+zkb-cli connect --addr 127.0.0.1:7878 --name bob   [--rules standard|no-touch] [--fleet-file private-fleet] [--transcript-out tr.txt]
 zkb-cli verify-transcript vectors/game_transcript_v1.txt
 docker compose up --build                   # from repo root; see ../deploy/WEB_CLIENT_INTEGRATION.md
 ```

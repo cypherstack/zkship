@@ -90,6 +90,7 @@ fn parse_action(args: &[String]) -> Result<CliAction, String> {
     let mut key_file = None;
     let mut rules = Rules::Standard;
     let mut fleet_hex = None;
+    let mut fleet_file = None;
     let mut transcript_out = None;
     while let Some(flag) = iter.next() {
         let Some(value) = iter.next() else {
@@ -107,13 +108,24 @@ fn parse_action(args: &[String]) -> Result<CliAction, String> {
                 }
             }
             "--fleet" => fleet_hex = Some(value.clone()),
+            "--fleet-file" => fleet_file = Some(value.clone()),
             "--transcript-out" => transcript_out = Some(value.clone()),
             _ => return Err(usage()),
         }
     }
-    let fleet = match fleet_hex {
-        Some(raw) => Some(Zeroizing::new(parse_fleet_hex(&raw, rules)?)),
-        None => None,
+    if fleet_hex.is_some() && fleet_file.is_some() {
+        return Err("use only one of --fleet or --fleet-file".to_string());
+    }
+    let fleet = match (fleet_hex, fleet_file) {
+        (Some(raw), None) => {
+            eprintln!(
+                "warning: --fleet exposes the secret placement via argv; prefer --fleet-file"
+            );
+            Some(parse_fleet_hex(&raw, rules)?)
+        }
+        (None, Some(path)) => Some(parse_fleet_file(&path, rules)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
     };
     Ok(CliAction::Play(Options {
         listen,
@@ -130,7 +142,7 @@ fn parse_action(args: &[String]) -> Result<CliAction, String> {
 fn usage() -> String {
     "usage:\n  \
      zkb-cli <listen|connect> --addr HOST:PORT [--name NAME] [--key-file PATH] \
-     [--rules standard|no-touch] [--fleet 30HEX] [--transcript-out PATH]\n  \
+     [--rules standard|no-touch] [--fleet-file PATH] [--transcript-out PATH]\n  \
      zkb-cli verify-transcript PATH"
         .to_string()
 }
@@ -668,13 +680,41 @@ fn decode_hex(raw: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn parse_fleet_hex(raw: &str, rules: Rules) -> Result<[u8; 3 * K], String> {
-    let bytes = decode_hex(raw).ok_or_else(|| "invalid hex in --fleet".to_string())?;
-    let arr: [u8; 3 * K] = bytes
-        .try_into()
-        .map_err(|_| format!("--fleet must be exactly {} hex chars", 6 * K))?;
-    Fleet::from_bytes(&arr, rules).map_err(|e| format!("invalid --fleet placement: {e}"))?;
+fn parse_fleet_hex(raw: &str, rules: Rules) -> Result<Zeroizing<[u8; 3 * K]>, String> {
+    let bytes = Zeroizing::new(
+        decode_hex(raw).ok_or_else(|| "invalid hex in fleet placement".to_string())?,
+    );
+    let arr = Zeroizing::new(
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("fleet placement must be exactly {} hex chars", 6 * K))?,
+    );
+    Fleet::from_bytes(&arr, rules).map_err(|e| format!("invalid fleet placement: {e}"))?;
     Ok(arr)
+}
+
+fn parse_fleet_file(path: &str, rules: Rules) -> Result<Zeroizing<[u8; 3 * K]>, String> {
+    const MAX_FLEET_FILE_BYTES: u64 = 128;
+    let file = std::fs::File::open(path).map_err(|e| format!("open fleet file {path}: {e}"))?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_FLEET_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read fleet file {path}: {e}"))?;
+    if bytes.len() as u64 > MAX_FLEET_FILE_BYTES {
+        return Err(format!(
+            "fleet file {path} exceeds {MAX_FLEET_FILE_BYTES}-byte limit"
+        ));
+    }
+    if bytes.len() == 3 * K {
+        let arr = Zeroizing::new(bytes.as_slice().try_into().expect("length checked"));
+        Fleet::from_bytes(&arr, rules)
+            .map_err(|e| format!("invalid fleet placement in {path}: {e}"))?;
+        return Ok(arr);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("fleet file {path} must contain 15 raw bytes or 30 hex digits"))?;
+    parse_fleet_hex(text.trim(), rules)
 }
 
 struct ParsedTranscript {
@@ -970,6 +1010,49 @@ mod tests {
         assert_ne!(fingerprint(&first), fingerprint(&second));
         assert_eq!(fingerprint(&first).len(), 64);
     }
+
+    #[test]
+    fn fleet_file_accepts_raw_or_hex_and_rejects_unsafe_inputs() {
+        let dir = KeyDir::new();
+        let raw = [0, 0, 0, 2, 0, 0, 4, 0, 0, 5, 0, 0, 7, 0, 0];
+        let raw_path = dir.0.join("fleet.raw");
+        std::fs::write(&raw_path, raw).unwrap();
+        assert_eq!(
+            parse_fleet_file(raw_path.to_str().unwrap(), Rules::Standard)
+                .unwrap()
+                .as_ref(),
+            &raw
+        );
+
+        let hex_path = dir.0.join("fleet.hex");
+        std::fs::write(&hex_path, format!("  {}\n", hex(&raw))).unwrap();
+        assert_eq!(
+            parse_fleet_file(hex_path.to_str().unwrap(), Rules::Standard)
+                .unwrap()
+                .as_ref(),
+            &raw
+        );
+
+        let oversized_path = dir.0.join("oversized");
+        std::fs::write(&oversized_path, vec![b'0'; 129]).unwrap();
+        assert!(parse_fleet_file(oversized_path.to_str().unwrap(), Rules::Standard).is_err());
+    }
+
+    #[test]
+    fn fleet_sources_are_mutually_exclusive() {
+        let args = vec![
+            "listen".to_string(),
+            "--fleet".to_string(),
+            "000000020000040000050000070000".to_string(),
+            "--fleet-file".to_string(),
+            "private-fleet".to_string(),
+        ];
+        assert!(matches!(
+            parse_action(&args),
+            Err(message) if message == "use only one of --fleet or --fleet-file"
+        ));
+    }
+
     fn test_session<'a>(
         key: &'a IdentityKeypair,
         role: Role,

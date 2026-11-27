@@ -30,6 +30,17 @@ pub const SHOT_PAYLOAD_LEN: usize = 1;
 
 pub const ANSWER_MISS_LEN: usize = zkb_core::answers::MISS_LEN;
 
+/// Largest v1 Answer payload (a non-sunk hit while all five ships remain).
+pub const MAX_ANSWER_PAYLOAD_LEN: usize = 577;
+
+/// Conservative upper bound for a valid v1 transcript's raw frame bytes:
+/// two largest-profile Commits, three coin frames, and 199 Shot/Answer pairs.
+pub const MAX_TRANSCRIPT_BYTES: usize = 2
+    * (COMMIT_NO_TOUCH_PAYLOAD_LEN + HEADER_LEN + SIGNATURE_LEN)
+    + 3 * (COIN_PAYLOAD_LEN + HEADER_LEN + SIGNATURE_LEN)
+    + (2 * zkb_core::params::N - 1)
+        * (SHOT_PAYLOAD_LEN + MAX_ANSWER_PAYLOAD_LEN + 2 * (HEADER_LEN + SIGNATURE_LEN));
+
 /// Wire discriminants. Payload sizes: Commit 19,488 (20,544 with the no-touch rule; the
 /// session checks the exact length for its profile); coin messages 32; Shot 1 (cell index);
 /// Answer by tag: miss 33, hit 449/513/577 (by unsunk ships), sunk 100/133/166/199 (by
@@ -188,6 +199,8 @@ mod tests {
         );
         assert_eq!(HEADER_LEN, 78);
         assert_eq!(MAX_TRANSCRIPT_FRAMES, 403);
+        assert_eq!(MAX_TRANSCRIPT_BYTES, 213_432);
+        assert!(ShotAnswer::is_possible_length(1, MAX_ANSWER_PAYLOAD_LEN));
     }
 
     #[test]

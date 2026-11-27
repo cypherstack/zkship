@@ -45,7 +45,11 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state.config);
     let verify_route = Router::new()
         .route("/api/v1/verify-transcript", post(http::verify_transcript))
-        .layer(RequestBodyLimitLayer::new(1024 * 1024));
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            http::verify_rate_limit,
+        ));
 
     let api_routes = Router::new()
         .route("/healthz", get(http::healthz))

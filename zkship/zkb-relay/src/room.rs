@@ -14,7 +14,9 @@ use zkb_session::hello::{self, CheckedHello, Hello};
 use zkb_session::identity::{AuthenticatedPeer, PeerAuthPolicy, PeerKey};
 use zkb_session::verify::{self, TranscriptVerdict};
 
-pub use zkb_session::codec::MAX_TRANSCRIPT_FRAMES;
+pub use zkb_session::codec::{
+    MAX_TRANSCRIPT_BYTES as MAX_ROOM_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_FRAMES,
+};
 const ROOM_ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 #[derive(Clone, Debug)]
@@ -199,6 +201,7 @@ struct Room {
     /// Stored as `(sender_seat_idx, raw_frame_bytes)` so reconnect catch-up
     /// only replays peer-authored frames past `after_seq`.
     frames: Vec<(usize, Vec<u8>)>,
+    transcript_bytes: usize,
     created_at: Instant,
     last_activity: Instant,
     finished_at: Option<Instant>,
@@ -255,6 +258,7 @@ pub struct RoomPublicInfo {
     pub sid: Option<String>,
     pub genesis_hash: Option<String>,
     pub frames_count: usize,
+    pub transcript_bytes: usize,
     pub verdict: Option<String>,
     pub winner: Option<String>,
 }
@@ -275,6 +279,8 @@ pub struct RoomTranscriptInfo {
 pub struct HealthStats {
     pub rooms: usize,
     pub quick_match_queued: usize,
+    pub transcript_bytes: usize,
+    pub max_transcript_bytes: usize,
 }
 
 pub struct AttachOutput {
@@ -287,6 +293,7 @@ struct ManagerInner {
     quick_queue_standard: VecDeque<String>,
     quick_queue_notouch: VecDeque<String>,
     next_conn_id: u64,
+    transcript_bytes: usize,
 }
 
 impl ManagerInner {
@@ -334,6 +341,8 @@ impl RoomManager {
         HealthStats {
             rooms: inner.rooms.len(),
             quick_match_queued: inner.quick_queue_standard.len() + inner.quick_queue_notouch.len(),
+            transcript_bytes: inner.transcript_bytes,
+            max_transcript_bytes: self.config.max_transcript_bytes,
         }
     }
 
@@ -367,6 +376,7 @@ impl RoomManager {
             head_seq: 0,
             head_hash: [0u8; 32],
             frames: Vec::new(),
+            transcript_bytes: 0,
             created_at: now,
             last_activity: now,
             finished_at: None,
@@ -659,6 +669,7 @@ impl RoomManager {
         raw: &[u8],
     ) -> Result<(u64, String), RoomOpError> {
         let mut inner = self.inner.lock().await;
+        let total_transcript_bytes = inner.transcript_bytes;
         let room = inner.rooms.get_mut(room_id).ok_or(RoomOpError::NotFound)?;
         let frame = SignedFrame::decode(raw)
             .map_err(|e| RoomOpError::ClassB(format!("malformed frame: {e}")))?;
@@ -703,10 +714,17 @@ impl RoomManager {
 
         let fhash = authenticated.frame().frame_hash();
         let is_resign = authenticated.frame().header().message_type == MessageType::Resign;
+        let (new_room_bytes, new_total_bytes) = next_transcript_sizes(
+            room.transcript_bytes,
+            total_transcript_bytes,
+            raw.len(),
+            self.config.max_transcript_bytes,
+        )?;
 
         room.head_seq += 1;
         room.head_hash = fhash;
         room.frames.push((seat_idx, raw.to_vec()));
+        room.transcript_bytes = new_room_bytes;
         room.last_activity = Instant::now();
 
         let peer_idx = 1 - seat_idx;
@@ -716,7 +734,9 @@ impl RoomManager {
             room.mark_finished("resign_relayed".to_string(), None);
         }
 
-        Ok((room.head_seq, hex(&fhash)))
+        let head_seq = room.head_seq;
+        inner.transcript_bytes = new_total_bytes;
+        Ok((head_seq, hex(&fhash)))
     }
 
     pub async fn claim_finished(
@@ -803,6 +823,7 @@ impl RoomManager {
             sid: room.bootstrap.as_ref().map(|b| hex(&b.sid)),
             genesis_hash: room.bootstrap.as_ref().map(|b| hex(&b.genesis_hash)),
             frames_count: room.frames.len(),
+            transcript_bytes: room.transcript_bytes,
             verdict: room.finish_verdict.as_ref().map(|(v, _)| v.clone()),
             winner: room.finish_verdict.as_ref().and_then(|(_, w)| w.clone()),
         })
@@ -867,6 +888,8 @@ impl RoomManager {
         }
         for (id, close_reason) in remove_ids {
             if let Some(room) = inner.rooms.remove(&id) {
+                inner.transcript_bytes =
+                    inner.transcript_bytes.saturating_sub(room.transcript_bytes);
                 if let Some(reason) = close_reason {
                     let event = ServerEvent::RoomClosed {
                         reason: reason.to_string(),
@@ -891,6 +914,27 @@ impl RoomManager {
             .quick_queue_notouch
             .retain(|id| rooms.contains_key(id));
     }
+}
+
+fn next_transcript_sizes(
+    room_bytes: usize,
+    total_bytes: usize,
+    frame_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<(usize, usize), RoomOpError> {
+    let new_room_bytes = room_bytes
+        .checked_add(frame_bytes)
+        .ok_or(RoomOpError::TranscriptFull)?;
+    if new_room_bytes > MAX_ROOM_TRANSCRIPT_BYTES {
+        return Err(RoomOpError::TranscriptFull);
+    }
+    let new_total_bytes = total_bytes
+        .checked_add(frame_bytes)
+        .ok_or(RoomOpError::ServerFull)?;
+    if new_total_bytes > max_total_bytes {
+        return Err(RoomOpError::ServerFull);
+    }
+    Ok((new_room_bytes, new_total_bytes))
 }
 
 fn identify_seat(room: &Room, token: &[u8; 32]) -> Option<usize> {
@@ -957,6 +1001,48 @@ pub fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use zkb_session::identity::IdentityKeypair;
+
+    #[test]
+    fn transcript_byte_budgets_reject_room_global_and_integer_overflow() {
+        assert!(matches!(
+            next_transcript_sizes(MAX_ROOM_TRANSCRIPT_BYTES - 1, 9, 1, 10),
+            Ok((MAX_ROOM_TRANSCRIPT_BYTES, 10))
+        ));
+        assert!(matches!(
+            next_transcript_sizes(MAX_ROOM_TRANSCRIPT_BYTES, 0, 1, usize::MAX),
+            Err(RoomOpError::TranscriptFull)
+        ));
+        assert!(matches!(
+            next_transcript_sizes(0, 10, 1, 10),
+            Err(RoomOpError::ServerFull)
+        ));
+        assert!(matches!(
+            next_transcript_sizes(0, usize::MAX, 1, usize::MAX),
+            Err(RoomOpError::ServerFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reaping_a_room_releases_its_transcript_budget() {
+        let config = RelayConfig {
+            finished_ttl: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        };
+        let manager = RoomManager::new(Arc::new(config));
+        let created = manager.create_room(Rules::Standard, false).await.unwrap();
+        {
+            let mut inner = manager.inner.lock().await;
+            let room = inner.rooms.get_mut(&created.room_id).unwrap();
+            room.transcript_bytes = 123;
+            room.mark_finished("test".to_string(), None);
+            inner.transcript_bytes = 123;
+        }
+
+        manager.reap_expired().await;
+        let stats = manager.health_stats().await;
+        assert_eq!(stats.rooms, 0);
+        assert_eq!(stats.transcript_bytes, 0);
+    }
 
     #[tokio::test]
     async fn attach_queues_reconnect_prefix_before_publishing_sender() {

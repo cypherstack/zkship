@@ -494,7 +494,7 @@ async fn origin_check_and_limits_are_enforced() {
     let cfg = RelayConfig {
         allowed_origins: vec!["https://play.zkship.example".to_string()],
         max_rooms: 1,
-        verify_per_min: 1,
+        verify_per_min: 2,
         ..Default::default()
     };
     let addr = spawn_relay(cfg).await;
@@ -515,9 +515,18 @@ async fn origin_check_and_limits_are_enforced() {
     assert_eq!(st, 503);
 
     // Rate limit on verify-transcript enforced.
-    let bad = r#"{"hello_one":"00","hello_two":"00","frames":[]}"#;
-    let (st1, _) = http_req(addr, "POST", "/api/v1/verify-transcript", Some(bad)).await;
+    let (st1, _) = http_req(
+        addr,
+        "POST",
+        "/api/v1/verify-transcript",
+        Some(r#"{"malformed": "#),
+    )
+    .await;
     assert_eq!(st1, 400);
-    let (st2, _) = http_req(addr, "POST", "/api/v1/verify-transcript", Some(bad)).await;
-    assert_eq!(st2, 429);
+    let oversized = "x".repeat(1024 * 1024 + 1);
+    let (st2, _) = http_req(addr, "POST", "/api/v1/verify-transcript", Some(&oversized)).await;
+    assert_eq!(st2, 413);
+    let valid_shape = r#"{"hello_one":"00","hello_two":"00","frames":[]}"#;
+    let (st3, _) = http_req(addr, "POST", "/api/v1/verify-transcript", Some(valid_shape)).await;
+    assert_eq!(st3, 429);
 }

@@ -104,6 +104,6 @@ All `Result` errors reject/throw structured `ClientErrorDto`: `{ kind, message, 
 - `ZKB_ALLOWED_ORIGINS` (default `*`; set exact origin list in production)
 - `ZKB_TRUST_PROXY` (`0` default; set `1` ONLY when running strictly behind Caddy/Nginx)
   - Reads `X-Real-IP` first, otherwise the **rightmost** entry in `X-Forwarded-For` appended by the trusted proxy.
-- Limits & TTLs: `ZKB_MAX_ROOMS` (`4096`), `ZKB_MAX_CONNS_PER_IP` (`32`), `ZKB_ROOM_CREATE_PER_MIN` (`60`), `ZKB_VERIFY_PER_MIN` (`30`), `ZKB_MAX_CONCURRENT_VERIFICATIONS` (`2`, global CPU-heavy verifier jobs), `ZKB_WAITING_TTL_SECS` (`600`), `ZKB_RECONNECT_GRACE_SECS` (`120`), `ZKB_TURN_TIMEOUT_SECS` (`300`), `ZKB_FINISHED_TTL_SECS` (`1800`).
+- Limits & TTLs: `ZKB_MAX_ROOMS` (`4096`), `ZKB_MAX_TRANSCRIPT_BYTES` (`134217728`, global stored transcript budget; each room is additionally capped at the 213432-byte v1 protocol maximum), `ZKB_MAX_CONNS_PER_IP` (`32`), `ZKB_ROOM_CREATE_PER_MIN` (`60`), `ZKB_VERIFY_PER_MIN` (`30`), `ZKB_MAX_CONCURRENT_VERIFICATIONS` (`2`, global CPU-heavy verifier jobs), `ZKB_WAITING_TTL_SECS` (`600`), `ZKB_RECONNECT_GRACE_SECS` (`120`), `ZKB_TURN_TIMEOUT_SECS` (`300`), `ZKB_FINISHED_TTL_SECS` (`1800`).
 
 See [../docker-compose.yml](../docker-compose.yml), [../docker-compose.tls.yml](../docker-compose.tls.yml), and [Caddyfile.example](Caddyfile.example) for container deployment.
